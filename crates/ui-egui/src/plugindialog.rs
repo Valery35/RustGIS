@@ -224,21 +224,25 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 ui.label(RichText::new(m.translate(&lang, &c.help)).weak());
                 ui.separator();
             }
-            egui::Grid::new(("plugin_form_grid", &d.plugin, &d.command)).num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                // A field lists the fields of the layer chosen above it.
-                let mut layer: Option<String> = None;
-                for f in &c.form {
-                    let text = m.translate(&lang, &f.label);
-                    let mut label = ui.label(if f.required { format!("{text} *") } else { text.to_string() });
-                    if !f.help.is_empty() {
-                        label = label.on_hover_text(m.translate(&lang, &f.help));
+            // A form of many fields scrolls rather than growing past the screen, so Run and the
+            // reasons it waits stay in view (#1964).
+            egui::ScrollArea::vertical().id_salt("plugin_form_fields").max_height(460.0).auto_shrink([false, true]).show(ui, |ui| {
+                egui::Grid::new(("plugin_form_grid", &d.plugin, &d.command)).num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    // A field lists the fields of the layer chosen above it.
+                    let mut layer: Option<String> = None;
+                    for f in &c.form {
+                        let text = m.translate(&lang, &f.label);
+                        let mut label = ui.label(if f.required { format!("{text} *") } else { text.to_string() });
+                        if !f.help.is_empty() {
+                            label = label.on_hover_text(m.translate(&lang, &f.help));
+                        }
+                        field(app, ui, f, &mut d.values, &mut d.texts, layer.as_deref(), m, &lang).labelled_by(label.id);
+                        if layer_kind(&f.kind).is_some() {
+                            layer = d.values.get(&f.name).and_then(Value::as_str).map(str::to_string);
+                        }
+                        ui.end_row();
                     }
-                    field(app, ui, f, &mut d.values, &mut d.texts, layer.as_deref(), m, &lang).labelled_by(label.id);
-                    if layer_kind(&f.kind).is_some() {
-                        layer = d.values.get(&f.name).and_then(Value::as_str).map(str::to_string);
-                    }
-                    ui.end_row();
-                }
+                });
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -459,6 +463,10 @@ mod tests {
         ]);
         let commands = m["commands"].as_array_mut().unwrap();
         commands.push(json!({"id": "q", "label": "Echo", "form": form}));
+        // A form at the manifest's limit of 64 fields (#1964).
+        commands.push(json!({"id": "qw", "label": "Echo Long", "form":
+            (0..64).map(|i| json!({"name": format!("p{i}"), "label": format!("Field {i}"), "kind": "text"}))
+                .collect::<Vec<_>>()}));
         // Echoes too (the test plugin answers by the id's first letter), with optional fields only.
         commands.push(json!({"id": "qq", "label": "Echo Optional", "form": [
             {"name": "count", "label": "Count", "kind": "number"},
@@ -559,6 +567,24 @@ mod tests {
         let echoed: Value = serde_json::from_str(answer).unwrap();
         assert_eq!(echoed["params"], json!({"count": 2.5, "agree": false}));
         plugins::unload("ui-dialog-optional");
+    }
+
+    /// A dialog at the manifest's limit of 64 fields scrolls, so Run and the reasons it waits
+    /// stay on screen (#1964).
+    #[test]
+    fn a_long_form_keeps_run_in_view() {
+        let mut h = launch("ui-dialog-long");
+        h.state_mut().run_by_user("plugin:ui-dialog-long/qw", Value::Null).unwrap();
+        h.run();
+        let run = h.get_by_label("Run").rect();
+        assert!(run.max.y <= h.ctx.content_rect().max.y, "Run is off screen: {run:?}");
+        // Every field is still there to fill in; none is required, so Run goes ahead.
+        h.get_by_label("Run").click();
+        h.run();
+        let Some(Ok(answer)) = &dialog(&h).result else { panic!("{:?}", dialog(&h).result) };
+        let echoed: Value = serde_json::from_str(answer).unwrap();
+        assert_eq!(echoed["params"], json!({}), "optional fields left alone are left out");
+        plugins::unload("ui-dialog-long");
     }
 
     /// While the dialog's run waits to start, an answer of the same command run with other
