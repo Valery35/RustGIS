@@ -1,5 +1,4 @@
 //! Real archive reads across the relay's approval, worker and completion boundaries.
-#![allow(clippy::unwrap_used, clippy::panic)]
 
 use super::*;
 use rustgis_engine::{
@@ -56,6 +55,43 @@ fn queue(relay: &Relay, grant: &Grant, message: Value) -> (u64, Receiver<Option<
 
 fn worker(ahead: reads::ReadAhead) -> Result<reads::Read, String> {
     std::thread::spawn(move || ahead.run(&rustgis_engine::analysis::control::Control::stoppable())).join().unwrap()
+}
+
+#[test]
+fn column_statistics_pause_for_the_read_worker_and_keep_cancel_and_authority() {
+    use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as Cell};
+    for mode in ["success", "cancel", "revoke"] {
+        let mut s = Session::new(Project::default());
+        let mut ds = Dataset::new("numbers", GeometryType::Point, vec![Field::new("value", FieldType::Double)]);
+        for n in [1.0, 2.0, 3.0] {
+            ds.push(None, vec![Cell::Float(n)]);
+        }
+        s.map_mut().add_dataset(ds);
+        let relay = Relay::start(0).unwrap();
+        let grant = relay.grant(true).unwrap();
+        let (_, rx) = queue(&relay, &grant, command(1, "table.statistics", json!({"layer":"numbers","field":"value"})));
+        assert_eq!(relay.poll(&mut s), 0, "must not count inline");
+        assert!(rx.try_recv().is_err(), "no reply before the worker completes");
+        let ahead = relay.take_archive_read().unwrap();
+        let done = if mode == "cancel" {
+            let control = rustgis_engine::analysis::control::Control::stoppable();
+            control.cancel();
+            std::thread::spawn(move || ahead.run(&control)).join().unwrap()
+        } else {
+            worker(ahead)
+        };
+        if mode == "revoke" {
+            drop(grant);
+        }
+        finish(&relay, &mut s, done);
+        let answer = reply(&rx);
+        assert_eq!(answer["result"]["isError"], mode != "success", "{mode}: {answer}");
+        if mode == "success" {
+            let text = answer["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("\"sum\":6") && text.contains("\"mean\":2"), "{text}");
+        }
+        relay.stop();
+    }
 }
 
 fn finish(relay: &Relay, session: &mut Session, done: Result<reads::Read, String>) {
@@ -570,4 +606,35 @@ fn archive_batch_resumes_same_context_after_validation_failure_or_cancellation()
         assert_ne!(s.map().layer(a).unwrap().renderer, before);
         relay.stop();
     }
+}
+
+#[test]
+fn shape_conversion_preview_uses_the_worker_without_implicitly_applying() {
+    use rustgis_engine::data::{Dataset, GeometryType};
+    let mut s = Session::new(Project::default());
+    let id = s.map_mut().add_dataset(Dataset::new("Polygons", GeometryType::Polygon, vec![]));
+    s.active_layer = Some(id);
+    s.run("edit.enable", &json!({"on":true})).unwrap();
+    s.run("edit.addFeature", &json!({"geometry":{"type":"Polygon","coordinates":[[[0.,0.],[0.01,0.],[0.01,0.01],[0.,0.01],[0.,0.]]]}}))
+        .unwrap();
+    let depth = s.undo_depth();
+    let relay = Relay::start(0).unwrap();
+    let grant = relay.grant(true).unwrap();
+    let (_, rx) = queue(&relay, &grant, command(1, "edit.previewShapeConversion", json!({"layer":id,"row":0,"kind":"circle"})));
+    assert_eq!(relay.poll(&mut s), 0);
+    assert!(rx.try_recv().is_err());
+    let done = worker(relay.take_archive_read().unwrap());
+    finish(&relay, &mut s, done);
+    let answer = reply(&rx);
+    assert!(answer.get("error").is_none(), "{answer}");
+    let result = answer.get("result").expect("preview returned no result");
+    assert_eq!(result["isError"], false, "{answer}");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let proposal: rustgis_engine::shape_conversion::Proposal = serde_json::from_str(text).unwrap();
+    assert_eq!((proposal.layer, proposal.row), (id, 0));
+    assert!(matches!(proposal.shape, rustgis_engine::shape_conversion::Shape::Circle(_)));
+    assert!(proposal.current(&s));
+    assert_eq!(s.undo_depth(), depth);
+    assert!(s.circle_spec(id, 0).is_none());
+    relay.stop();
 }

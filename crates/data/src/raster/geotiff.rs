@@ -545,7 +545,7 @@ fn proj4_of_keys(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<(String, 
         Some(21) => format!("+proj=ortho +lat_0={lat0} +lon_0={lon0} +x_0={x0} +y_0={y0}"),
         // CT_Robinson.
         Some(23) => format!("+proj=robin +lon_0={lon0} +x_0={x0} +y_0={y0}"),
-        // MODIS's grid; RustGIS computes it (`rustgis_geom::Sinusoidal`).
+        // MODIS's grid.
         Some(24) => format!("+proj=sinu +lon_0={lon0} +x_0={x0} +y_0={y0}"),
         Some(28) => format!("+proj=cea +lat_ts={lat1} +lon_0={lon0} +x_0={x0} +y_0={y0}"),
         Some(c) => return Err(err(format!("the file's own projection (coordinate transformation {c}) isn't supported"))),
@@ -581,8 +581,7 @@ fn proj4_of_keys(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<(String, 
 }
 
 /// Whether two PROJ definitions place the same points: points around the projection's origin,
-/// unprojected by both (as RustGIS computes them, sinusoidal and PROJ-compatible equidistant
-/// cylindrical included), land within a centimetre.
+/// unprojected by both, land within a centimetre.
 fn same_projection(a: &str, b: &str) -> bool {
     let offsets = [(0.0, 0.0), (100_000.0, 50_000.0), (-250_000.0, 150_000.0), (300_000.0, -200_000.0), (-50_000.0, -400_000.0)];
     let (Ok(ta), Ok(tb)) = (super::crs::transformer_of(a), super::crs::transformer_of(b)) else { return false };
@@ -807,12 +806,23 @@ fn lzw<R: Read + Seek>(dec: &mut Decoder<R>) -> bool {
     dec.find_tag_unsigned::<u16>(Tag::Compression).ok().flatten() == Some(5)
 }
 
-/// Decodes chunk `index` (a strip or tile) of the current image. The `tiff` crate fails on some
-/// LZW chunks it should read (issue #350): those are decoded by [`super::lzw`] instead.
-pub(crate) fn read_chunk<R: Read + Seek>(dec: &mut Decoder<R>, index: u32) -> Result<DecodingResult> {
+/// Decodes chunk `index` (a strip or tile) of the current image: its samples, and which of them
+/// its own encoding marks invalid (LERC's validity masks), for the caller to make no-data with
+/// [`super::lerc::blank`]. The `tiff` crate fails on some LZW chunks it should read (issue #350):
+/// those are decoded by [`super::lzw`] instead. It has no LERC codec: LERC chunks are decoded by
+/// [`super::lerc`] (#1818), `table` keeping the image's chunk offsets from one call to the next.
+pub(crate) fn read_chunk<R: Read + Seek>(
+    dec: &mut Decoder<R>,
+    index: u32,
+    table: &mut super::lerc::Table,
+) -> Result<(DecodingResult, Option<Vec<bool>>)> {
+    if super::lerc::is_lerc(dec) {
+        let c = super::lerc::chunk(dec, index, table)?;
+        return Ok((c.samples, c.gaps));
+    }
     match dec.read_chunk(index) {
-        Ok(v) => Ok(v),
-        Err(e) if lzw(dec) => super::lzw::chunk(dec, index).map_err(|_| err(e)),
+        Ok(v) => Ok((v, None)),
+        Err(e) if lzw(dec) => super::lzw::chunk(dec, index).map(|v| (v, None)).map_err(|_| err(e)),
         Err(e) => Err(err(e)),
     }
 }
@@ -1095,7 +1105,6 @@ impl Chunks {
     /// Copies every `k`-th pixel each way of chunk `c` of `plane` (decoded as `values`) into
     /// `bands`, each `ow` pixels wide, counting in `rounded` (by band) the pixels copied whose bit
     /// is set in `changed` (from [`rounded_bits`]).
-    #[allow(clippy::too_many_arguments)]
     fn place(
         &self,
         bands: &mut [Vec<f32>],
@@ -1157,7 +1166,8 @@ const PARALLEL_CHUNKS: u64 = 16;
 /// made as it is read, for a file too large to hold that has none. Returns the bands. With `k`
 /// 1, the whole image a chunk at a time. With `open`, chunks are decoded on several threads,
 /// each reading image `image` of its own copy of the file.
-#[allow(clippy::too_many_arguments)]
+/// Progress counts chunks examined, including ones skipped by the overview. Cancel is checked
+/// between chunks; decoding and placing an individual chunk cannot be interrupted.
 fn decimate<R: Read + Seek>(
     dec: &mut Decoder<R>,
     w: u32,
@@ -1168,6 +1178,7 @@ fn decimate<R: Read + Seek>(
     nodata: Uncounted,
     open: Option<(Opener<'_>, usize, Limits)>,
 ) -> Result<(Vec<Vec<f32>>, &'static str, Vec<u64>)> {
+    crate::progress::check()?;
     let k = k.max(1);
     let (ow, oh) = (w.div_ceil(k) as usize, h.div_ceil(k) as usize);
     let mut bands = (0..nbands).map(|_| super::filled(ow, oh, f32::NAN)).collect::<Result<Vec<_>>>()?;
@@ -1187,22 +1198,28 @@ fn decimate<R: Read + Seek>(
         }
     }
     let _ = open;
+    crate::progress::begin(usize::try_from(chunks.count()).unwrap_or(usize::MAX));
     let mut data_type = "Float32";
     let mut rounded = vec![0u64; nbands];
+    let mut table = super::lerc::Table::default();
     for i in 0..chunks.count() {
-        let Some((plane, index)) = chunks.wanted(i, k) else { continue };
-        let buf = read_chunk(dec, index)?;
-        let changed = rounded_bits(&buf, nodata);
-        let (values, dt) = to_f32(buf, (ow, oh))?;
-        data_type = dt;
-        chunks.place(&mut bands, &values, changed.as_deref(), &mut rounded, plane, index, k, ow);
+        crate::progress::check()?;
+        if let Some((plane, index)) = chunks.wanted(i, k) {
+            let (buf, gaps) = read_chunk(dec, index, &mut table)?;
+            let changed = rounded_bits(&buf, nodata);
+            let (mut values, dt) = to_f32(buf, (ow, oh))?;
+            super::lerc::blank(&mut values, gaps.as_deref());
+            data_type = dt;
+            chunks.place(&mut bands, &values, changed.as_deref(), &mut rounded, plane, index, k, ow);
+        }
+        crate::progress::step(1)?;
     }
+    crate::progress::check()?;
     Ok((bands, data_type, rounded))
 }
 
 /// [`decimate`] on `threads` threads, each with its own decoder taking the next chunk in turn.
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(clippy::too_many_arguments)]
 fn decimate_parallel(
     chunks: Chunks,
     bands: Vec<Vec<f32>>,
@@ -1216,6 +1233,9 @@ fn decimate_parallel(
 ) -> Result<(Vec<Vec<f32>>, &'static str, Vec<u64>)> {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    crate::progress::begin(usize::try_from(chunks.count()).unwrap_or(usize::MAX));
+    crate::progress::check()?;
+    let probe = crate::progress::current();
     let next = AtomicU64::new(0);
     let failed = AtomicBool::new(false);
     let failure: Mutex<Option<DataError>> = Mutex::new(None);
@@ -1228,24 +1248,38 @@ fn decimate_parallel(
         }
     };
     let work = || {
+        let _guard = crate::progress::install(probe.clone());
+        if let Err(e) = crate::progress::check() {
+            return fail(e);
+        }
         let dec = open().map_err(err).and_then(|r| Decoder::new(r).map_err(err)).map(|d| d.with_limits(limits.clone()));
         let mut dec = match dec.and_then(|mut d| d.seek_to_image(image).map_err(err).map(|()| d)) {
             Ok(d) => d,
             Err(e) => return fail(e),
         };
+        let mut table = super::lerc::Table::default();
         while !failed.load(Ordering::Relaxed) {
+            if let Err(e) = crate::progress::check() {
+                return fail(e);
+            }
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= chunks.count() {
                 break;
             }
-            let Some((plane, index)) = chunks.wanted(i, k) else { continue };
-            match read_chunk(&mut dec, index) {
-                Ok(buf) => {
+            let Some((plane, index)) = chunks.wanted(i, k) else {
+                if let Err(e) = crate::progress::step(1) {
+                    return fail(e);
+                }
+                continue;
+            };
+            match read_chunk(&mut dec, index, &mut table) {
+                Ok((buf, gaps)) => {
                     let changed = rounded_bits(&buf, nodata);
-                    let (values, dt) = match to_f32(buf, (ow, oh)) {
+                    let (mut values, dt) = match to_f32(buf, (ow, oh)) {
                         Ok(v) => v,
                         Err(e) => return fail(e),
                     };
+                    super::lerc::blank(&mut values, gaps.as_deref());
                     if let Ok(mut o) = out.lock() {
                         let (bands, data_type, rounded) = &mut *o;
                         *data_type = dt;
@@ -1253,6 +1287,9 @@ fn decimate_parallel(
                     }
                 }
                 Err(e) => return fail(e),
+            }
+            if let Err(e) = crate::progress::step(1) {
+                return fail(e);
             }
         }
     };
@@ -1271,6 +1308,7 @@ fn decimate_parallel(
     if let Some(e) = failure.into_inner().ok().flatten() {
         return Err(e);
     }
+    crate::progress::check()?;
     out.into_inner().map_err(|_| err("a chunk couldn't be decoded"))
 }
 
@@ -1329,7 +1367,7 @@ pub fn read_file(path: &std::path::Path, name: &str) -> Result<Raster> {
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn read_file_with_nodata(path: &std::path::Path, name: &str, sidecar_nodata: Option<f64>) -> Result<Raster> {
     let path = path.to_path_buf();
-    let open = move || -> std::io::Result<Reader<'static>> { reader(std::io::BufReader::new(std::fs::File::open(&path)?)) };
+    let open = move || -> std::io::Result<Reader<'static>> { reader(std::io::BufReader::new(crate::provenance::open(&path)?)) };
     read_limited_with_nodata(open().map_err(err)?, name, max_samples(), Some(&open), sidecar_nodata)
 }
 
@@ -1529,7 +1567,10 @@ pub(super) fn read_limited_with_nodata(
     // A large image, from a file, is read a chunk at a time on several threads (not one of
     // fewer than 8 bits a sample, whose chunks pack several pixels to a byte).
     let chunked = open.is_some() && n >= 1 << 20 && bits(&mut dec) >= 8;
-    let whole = if decimate_by > 1 || extra_samples || planar_tiles || chunked {
+    // The decoder has no LERC codec: such an image is read a chunk at a time, every chunk decoded
+    // by [`super::lerc`] (#1818).
+    let lerc = super::lerc::is_lerc(&mut dec);
+    let whole = if decimate_by > 1 || extra_samples || planar_tiles || chunked || lerc {
         None
     } else {
         let mut buf = DecodingResult::U8(Vec::new());
@@ -1619,6 +1660,7 @@ pub(super) fn read_limited_with_nodata(
         let mut r = Raster::new(name, w, h, bands, super::unreferenced(w, h), Crs::LonLat, geo.nodata, color, data_type)?;
         r.georeferenced = false;
         r.overview = overview;
+        r.step = decimate_by.max(1);
         r.rounded = rounded;
         r.copyright = copyright.filter(|c| !c.is_empty());
         r.lost.extend(copyright_lost);
@@ -1641,14 +1683,20 @@ pub(super) fn read_limited_with_nodata(
     };
     transform.pixel_width *= sx;
     transform.pixel_height *= sy;
+    let mut turned = None;
     let (bands, w, h) = match geo.affine {
         Some([x, xc, xr, y, yc, yr]) => {
-            let (bands, ow, oh, north_up) = super::north_up(bands, w, h, [x, xc * sx, xr * sy, y, yc * sx, yr * sy], max)?;
+            let affine = [x, xc * sx, xr * sy, y, yc * sx, yr * sy];
+            let (bands, ow, oh, north_up) = super::north_up(&bands, w, h, affine, max)?;
+            // The file's own placement, not the scaled one: its pixels are the ones it is coarser than.
+            turned = Some(turned_note([x, xc, xr, y, yc, yr], (ow, oh), &north_up));
             transform = north_up;
             (bands, ow, oh)
         }
         None => (bands, w, h),
     };
+    // What makes a system the file doesn't give one read as WGS 84, said once.
+    let mut assumed = None;
     let crs = match geo.crs {
         Some(c) => c,
         None => {
@@ -1665,6 +1713,20 @@ pub(super) fn read_limited_with_nodata(
                 return Err(DataError::Format(e.clone()));
             }
             if geo.geographic_model || degrees {
+                assumed = Some(match &geo.custom_error {
+                    // The file's own projection couldn't be read, but its coordinates fit in degrees:
+                    // why is said, not dropped.
+                    Some(e) => super::assumed_wgs84_note(&format!(
+                        "its own coordinate system can't be read ({})",
+                        e.strip_prefix("GeoTIFF: ").unwrap_or(e)
+                    )),
+                    None if geo.geographic_model => {
+                        "its geographic coordinate system has no EPSG code, so its datum isn't read; its coordinates are \
+                         read as longitude/latitude on WGS 84"
+                            .to_string()
+                    }
+                    None => super::assumed_wgs84_note("it doesn't say its coordinate system"),
+                });
                 Crs::LonLat
             } else {
                 return Err(err("the file's coordinate system isn't recognised"));
@@ -1673,16 +1735,43 @@ pub(super) fn read_limited_with_nodata(
     };
     let mut r = Raster::new(name, w, h, bands, transform, crs, geo.nodata, color, data_type)?;
     r.overview = overview;
+    // A turned image is resampled to a grid of its own: its pixels are no longer the file's.
+    r.step = if geo.affine.is_none() { decimate_by.max(1) } else { 1 };
     r.rounded = rounded;
     r.copyright = copyright.filter(|c| !c.is_empty());
     r.lost.extend(copyright_lost);
     r.lost.extend(super::planetary::note_of(crs));
+    r.lost.extend(assumed);
+    r.lost.extend(turned);
     r.lost.extend(table_lost);
     r.lost.extend(mask_lost);
     if let Some(p) = &described {
         r.apply_pam(p, super::pam::GDAL_METADATA);
     }
     Ok(r)
+}
+
+/// What turning a rotated or skewed image north up says ([`super::north_up`]): its pixels are
+/// resampled, nearest pixel, onto square ones of the same area, coarser when the grid would pass the
+/// sample limit. `affine` is the file's own, at full resolution, `(w, h)` the grid's size and `grid`
+/// its placement.
+fn turned_note(affine: [f64; 6], (w, h): (u32, u32), grid: &GeoTransform) -> String {
+    let [_, xc, xr, _, yc, yr] = affine;
+    let own = (xc * yr - xr * yc).abs().sqrt();
+    // Four significant digits.
+    let short = |v: f64| {
+        let digits = if v.is_finite() && v != 0.0 { (3 - v.abs().log10().floor() as i32).clamp(0, 15) } else { 0 };
+        format!("{v:.*}", digits as usize)
+    };
+    let mut note = format!(
+        "it is rotated or skewed, so it is resampled (nearest pixel) onto a north-up grid of {w} × {h} pixels of {} each; \
+         values are taken from source pixel centres, and the grid's corners beyond the image are empty",
+        short(grid.pixel_width)
+    );
+    if grid.pixel_width > own * (1.0 + 1e-9) {
+        note.push_str(&format!(", and its pixels are coarser than the file's ({}) to keep the grid within the sample limit", short(own)));
+    }
+    note
 }
 
 /// The GeoKey directory a raster's coordinate system is written as, and the user-defined system
@@ -1973,6 +2062,84 @@ mod tests {
     use super::*;
     use crate::raster::tests::small;
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn chunked_reads_count_progress_and_stop_before_or_during_serial_and_parallel_work() {
+        use crate::progress::{install, tests::Counted};
+        use std::io::Cursor;
+        use std::sync::atomic::Ordering;
+
+        // Sixteen strips; k=4 skips twelve of them, but progress still reaches its total.
+        let values: Vec<f32> = (0..256).map(|i| i as f32).collect();
+        let mut encoded = Cursor::new(Vec::new());
+        {
+            let mut enc = tiff::encoder::TiffEncoder::new(&mut encoded).unwrap();
+            let mut img = enc.new_image::<tiff::encoder::colortype::Gray32Float>(16, 16).unwrap();
+            img.rows_per_strip(1).unwrap();
+            img.write_data(&values).unwrap();
+        }
+        let bytes = encoded.into_inner();
+        for parallel in [false, true] {
+            for k in [1u32, 4] {
+                for after in [None, Some(0), Some(1)] {
+                    let probe = after.map_or_else(|| std::sync::Arc::new(Counted::default()), Counted::cancelling_after);
+                    let mut dec = Decoder::new(Cursor::new(&bytes)).unwrap();
+                    let chunks = Chunks::new(&mut dec, 16, 16, 1, false);
+                    let _guard = install(Some(probe.clone()));
+                    let got = if parallel {
+                        let caller = std::thread::current().id();
+                        let open = || {
+                            // Make a worker, rather than the calling thread, count the first
+                            // chunk. This catches a missing thread-local probe handover even
+                            // when the caller could otherwise decode the entire tiny fixture.
+                            if std::thread::current().id() == caller {
+                                let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                                while probe.done.load(Ordering::Relaxed) == 0 {
+                                    if std::time::Instant::now() >= end {
+                                        return Err(std::io::Error::other("worker never reported chunk progress"));
+                                    }
+                                    std::thread::yield_now();
+                                }
+                            }
+                            reader(Cursor::new(bytes.clone()))
+                        };
+                        let side = 16usize.div_ceil(k as usize);
+                        decimate_parallel(
+                            chunks,
+                            vec![vec![f32::NAN; side * side]],
+                            k,
+                            (side, side),
+                            Uncounted::new(None, None),
+                            2,
+                            &open,
+                            0,
+                            Limits::default(),
+                        )
+                    } else {
+                        decimate(&mut dec, 16, 16, 1, false, k, Uncounted::new(None, None), None)
+                    };
+                    if let Some(after) = after {
+                        assert!(matches!(got, Err(DataError::Cancelled)), "parallel={parallel}, k={k}, after={after}: {got:?}");
+                        let done = probe.done.load(Ordering::Relaxed);
+                        assert!(done >= after && done < 16, "{done} chunks counted before Cancel");
+                        assert!(matches!(crate::progress::check(), Err(DataError::Cancelled)), "the caller keeps its probe");
+                    } else {
+                        let (bands, data_type, rounded) = got.unwrap();
+                        let expected: Vec<f32> = (0..16)
+                            .step_by(k as usize)
+                            .flat_map(|y| (0..16).step_by(k as usize).map(move |x| (y * 16 + x) as f32))
+                            .collect();
+                        assert_eq!(bands, vec![expected]);
+                        assert_eq!(data_type, "Float32");
+                        assert_eq!(rounded, vec![0]);
+                        assert_eq!(probe.total.load(Ordering::Relaxed), 16);
+                        assert_eq!(probe.done.load(Ordering::Relaxed), 16);
+                    }
+                }
+            }
+        }
+    }
+
     /// Who holds the rights (the Copyright tag) is written by both writers and read back, as the
     /// ASCII a TIFF tag holds (`©` as `(c)`, control characters as spaces, others as `?`); a
     /// raster without it writes none.
@@ -2138,6 +2305,115 @@ mod tests {
         // A degenerate matrix (no area) is refused, not divided by.
         let flat = [30.0, 60.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         assert!(read(std::io::Cursor::new(tests_support::matrix_tiff(flat, false)), "flat").is_err());
+    }
+
+    /// A 2 × 2 byte image whose upper left corner is `corner`, `step` a pixel, with this GeoKey
+    /// directory (none: the file gives no coordinate system).
+    fn placed_tiff(corner: (f64, f64), step: f64, keys: Option<&[u16]>) -> Vec<u8> {
+        use tiff::encoder::{TiffEncoder, colortype};
+        let mut out = std::io::Cursor::new(Vec::new());
+        let mut enc = TiffEncoder::new(&mut out).unwrap_or_else(|e| panic!("{e}"));
+        let mut img = enc.new_image::<colortype::Gray8>(2, 2).unwrap_or_else(|e| panic!("{e}"));
+        img.encoder().write_tag(Tag::ModelPixelScaleTag, &[step, step, 0.0][..]).unwrap_or_else(|e| panic!("{e}"));
+        img.encoder().write_tag(Tag::ModelTiepointTag, &[0.0f64, 0.0, 0.0, corner.0, corner.1, 0.0][..]).unwrap_or_else(|e| panic!("{e}"));
+        if let Some(keys) = keys {
+            img.encoder().write_tag(Tag::GeoKeyDirectoryTag, keys).unwrap_or_else(|e| panic!("{e}"));
+        }
+        img.write_data(&[1u8, 2, 3, 4]).unwrap_or_else(|e| panic!("{e}"));
+        out.into_inner()
+    }
+
+    /// A grid whose file gives no usable coordinate system but whose coordinates fit in degrees is
+    /// read as WGS 84 and says why, once. A file that gives its system says nothing of the kind, and
+    /// metres of a projection that can't be read are still refused with the reason (AGENTS.md, Never
+    /// silent).
+    #[test]
+    fn a_grid_read_as_wgs84_says_why() {
+        let read_tiff = |bytes: Vec<u8>| read(std::io::Cursor::new(bytes), "g");
+        // No GeoKeys at all.
+        let r = read_tiff(placed_tiff((10.0, 50.0), 0.5, None)).unwrap();
+        assert_eq!(r.crs, Crs::LonLat);
+        assert_eq!(r.lost.len(), 1, "{:?}", r.lost);
+        assert!(r.lost[0].contains("doesn't say its coordinate system") && r.lost[0].contains("WGS 84"), "{:?}", r.lost);
+        // Its own projection (a coordinate transformation that isn't supported) can't be read, but its
+        // coordinates fit in degrees: the reason is said, not dropped.
+        let own = [1u16, 1, 0, 3, 1024, 0, 1, 1, 3072, 0, 1, 32767, 3075, 0, 1, 99];
+        let r = read_tiff(placed_tiff((10.0, 50.0), 0.5, Some(&own))).unwrap();
+        assert_eq!(r.crs, Crs::LonLat);
+        assert_eq!(r.lost.len(), 1, "{:?}", r.lost);
+        assert!(
+            r.lost[0].starts_with("its own coordinate system can't be read (")
+                && r.lost[0].contains("coordinate transformation 99")
+                && r.lost[0].ends_with("so it's read as WGS 84"),
+            "{:?}",
+            r.lost
+        );
+        // Metres of the same projection are refused, saying why.
+        let e = read_tiff(placed_tiff((500_000.0, 4_000_000.0), 30.0, Some(&own))).unwrap_err().to_string();
+        assert!(e.contains("coordinate transformation 99"), "{e}");
+        // A geographic system with no EPSG code: its datum isn't read.
+        let user = [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 32767];
+        let r = read_tiff(placed_tiff((10.0, 50.0), 0.5, Some(&user))).unwrap();
+        assert_eq!(r.crs, Crs::LonLat);
+        assert_eq!(r.lost.len(), 1, "{:?}", r.lost);
+        assert!(r.lost[0].contains("no EPSG code, so its datum isn't read"), "{:?}", r.lost);
+        // Files that give their system say nothing: WGS 84 by its code, and a UTM zone.
+        let wgs84 = [1u16, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326];
+        let utm = [1u16, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 32633];
+        for (bytes, crs) in [
+            (placed_tiff((10.0, 50.0), 0.5, Some(&wgs84)), Crs::LonLat),
+            (placed_tiff((500_000.0, 4_000_000.0), 30.0, Some(&utm)), Crs::from_epsg(32633).unwrap()),
+        ] {
+            let r = read_tiff(bytes).unwrap();
+            assert_eq!(r.crs, crs);
+            assert!(r.lost.is_empty(), "{:?}", r.lost);
+        }
+    }
+
+    /// A rotated or skewed image says it was resampled onto a north-up grid, once, and how; its
+    /// pixels are said to be coarser than the file's only when the grid had to be. A north-up image
+    /// says nothing of the kind.
+    #[test]
+    fn a_turned_image_says_how_it_was_resampled() {
+        let rotated = [30.0, 5.0, 0.0, 400_000.0, 3.0, -30.0, 0.0, 5_000_000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let r = read(std::io::Cursor::new(tests_support::matrix_tiff(rotated, false)), "rot").unwrap();
+        assert_eq!(r.lost.len(), 1, "{:?}", r.lost);
+        let said = &r.lost[0];
+        assert!(said.starts_with("it is rotated or skewed, so it is resampled (nearest pixel) onto a north-up grid of "), "{said}");
+        assert!(said.contains(&format!("{} × {} pixels of 30.25 each", r.width, r.height)), "{said}");
+        assert!(!said.contains("coarser"), "{said}");
+        // Past the sample limit the grid is coarser than the file's pixels, and says so.
+        let file = tests_support::matrix_tiff(rotated, false);
+        let r = read_limited(reader(std::io::Cursor::new(&file)).unwrap(), "coarse", 200, None).unwrap();
+        assert!(r.width * r.height <= 200 && r.transform.pixel_width > 30.25);
+        assert_eq!(r.lost.len(), 1, "{:?}", r.lost);
+        assert!(r.lost[0].contains("coarser") && r.lost[0].contains("30.25"), "{:?}", r.lost);
+        // Decimation makes the source read coarser before north_up; compare to the original file.
+        let r = read_limited(reader(std::io::Cursor::new(&file)).unwrap(), "decimated", 50, None).unwrap();
+        assert_eq!(r.overview, Some((20, 10)));
+        assert!(r.width * r.height <= 50);
+        assert!(r.lost.iter().any(|n| n.contains("coarser than the file's (30.25)")), "{:?}", r.lost);
+        // A stored overview also uses the full-resolution affine for the comparison.
+        let mut out = std::io::Cursor::new(Vec::new());
+        {
+            use tiff::encoder::{TiffEncoder, colortype};
+            let mut enc = TiffEncoder::new(&mut out).unwrap();
+            let mut image = enc.new_image::<colortype::Gray8>(20, 10).unwrap();
+            image.encoder().write_tag(Tag::Unknown(34264), &rotated[..]).unwrap();
+            let keys = [1u16, 1, 0, 1, 3072, 0, 1, 32633];
+            image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &keys[..]).unwrap();
+            image.write_data(&[100u8; 200]).unwrap();
+            let mut image = enc.new_image::<colortype::Gray8>(10, 5).unwrap();
+            image.encoder().write_tag(Tag::NewSubfileType, 1u32).unwrap();
+            image.write_data(&[100u8; 50]).unwrap();
+        }
+        let r = read_limited(reader(std::io::Cursor::new(out.into_inner())).unwrap(), "overview", 50, None).unwrap();
+        assert_eq!(r.overview, Some((20, 10)));
+        assert!(r.lost.iter().any(|n| n.contains("coarser than the file's (30.25)")), "{:?}", r.lost);
+        // The same image placed north up needs no resampling, and says nothing.
+        let level = [30.0, 0.0, 0.0, 400_000.0, 0.0, -30.0, 0.0, 5_000_000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let r = read(std::io::Cursor::new(tests_support::matrix_tiff(level, false)), "level").unwrap();
+        assert!(r.lost.is_empty(), "{:?}", r.lost);
     }
 
     #[test]
@@ -2328,8 +2604,9 @@ mod tests {
             let back = custom_crs(&k, &d, &a).unwrap().custom_def().unwrap().proj4.clone();
             assert!(same_projection(def, &back), "{def}: {back}");
         }
-        // PROJ uses the same coordinates on a sphere of the semi-major axis.
-        assert!(same_projection(
+        // PROJ 9.8 computes it on the ellipsoid: on the sphere of its semi-major axis it is
+        // another projection.
+        assert!(!same_projection(
             "+proj=eqc +lat_ts=0 +lon_0=0 +datum=WGS84 +units=m +no_defs",
             "+proj=eqc +lat_ts=0 +lon_0=0 +R=6378137 +units=m +no_defs"
         ));

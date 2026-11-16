@@ -6,9 +6,10 @@
 
 use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::map::layout::{
-    Arrange, ArrowStyle, CoordFormat, Element, ElementKind, Grid, GridKind, GridStyle, Layout, LineHead, MAX_COLORBAR_TICKS,
-    MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LEGEND_COLUMNS, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM,
-    ScaleBarStyle, ScaleUnits, TickSide, frame_camera, line_angle, line_length,
+    Arrange, ArrowStyle, CoordFormat, Element, ElementKind, Grid, GridKind, GridStyle, Layout, LineHead, MAX_BACKGROUND_PADDING,
+    MAX_BACKGROUND_RADIUS, MAX_BACKGROUND_WIDTH, MAX_COLORBAR_TICKS, MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LEGEND_COLUMNS,
+    MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TickSide, frame_camera,
+    line_angle, line_length,
 };
 use rustgis_engine::map::symbology::Dash;
 use serde_json::{Value, json};
@@ -121,6 +122,8 @@ pub struct LayoutView {
     /// What the page was drawn without (in the browser, which doesn't wait): drawn again once it
     /// lands.
     page_wait: Option<PageWait>,
+    /// The last clipping warning shown, cleared when the text fits or another layout opens.
+    text_warning: Option<String>,
     /// Page zoom (0 or 1 = fit) and pan, in screen points, of the layout `viewed` names.
     zoom: f32,
     pan: egui::Vec2,
@@ -206,6 +209,7 @@ pub(crate) fn follow_project(app: &mut RustGisApp) {
         app.layout.drawn = None;
         app.layout.typing.clear();
         app.layout.viewed = None;
+        app.layout.text_warning = None;
         app.layout.views.clear();
     }
     app.layout.project = Some(opened);
@@ -267,6 +271,7 @@ impl LayoutView {
         if self.viewed.as_deref() == Some(name) {
             return;
         }
+        self.text_warning = None;
         if let Some(old) = self.viewed.replace(name.to_string()) {
             self.views.insert(old, (self.zoom, self.pan));
         }
@@ -568,7 +573,6 @@ fn ruler_at(lv: &LayoutView, area: Rect, p: Pos2) -> Option<bool> {
 
 /// Puts down a guide dragged out of a ruler or moved: dropped on a ruler or off the view, it's
 /// removed.
-#[allow(clippy::too_many_arguments)]
 fn drop_guide(
     app: &mut RustGisApp,
     layout: &Layout,
@@ -742,6 +746,14 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             let web = cfg!(target_arch = "wasm32");
             let frames = (web && frames_pending) || said.to_come;
             say_frame_shadows(app, &said);
+            let clipped = rustgis_engine::render::layout::clipped_text(&layout, &app.session.project.maps, dpi, &info);
+            let note = rustgis_engine::render::layout::clipped_text_notice(&clipped);
+            if note != app.layout.text_warning {
+                if let Some(note) = &note {
+                    app.session.warn(note.clone());
+                }
+                app.layout.text_warning = note;
+            }
             // Waiting for the frames draws it again anyway: the legends are asked about once
             // they are whole.
             let legends = web && !frames && rustgis_engine::render::layout::legends_pending(&layout, &app.session.project.maps);
@@ -1698,7 +1710,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         });
                         ui.end_row();
                     }
-                    ElementKind::Legend { title, all_classes, hide_other, columns, .. } => {
+                    ElementKind::Legend { title, all_classes, hide_other, show_no_data, columns, .. } => {
                         let input_label = ui.label(tl!("Title"));
                         if let Some(tt) = text_field(app, ui, (li, id, "title"), title, false, input_label.id) {
                             update(app, json!({"title": tt}));
@@ -1715,6 +1727,12 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         let mut hide = *hide_other;
                         if ui.checkbox(&mut hide, "").labelled_by(input_label.id).changed() {
                             update(app, json!({"hideOther": hide}));
+                        }
+                        ui.end_row();
+                        let input_label = ui.label(tl!("Show no data"));
+                        let mut show = *show_no_data;
+                        if ui.checkbox(&mut show, "").labelled_by(input_label.id).changed() {
+                            update(app, json!({"showNoData": show}));
                         }
                         ui.end_row();
                         let input_label = ui.label(tl!("Columns"));
@@ -2195,6 +2213,56 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
             if ui.button(tl!("Remove Extent Indicator")).clicked() {
                 update(app, json!({"extentIndicator": false}));
             }
+        });
+    }
+    // Its background (#2257): a box behind its content, which a map frame, drawing its own paper,
+    // doesn't take.
+    if e.kind.takes_background() {
+        crate::textform::section(ui, "Background", |ui| {
+            let mut on = e.background.is_some();
+            if ui.checkbox(&mut on, tl!("Background")).on_hover_text(tl!("A box behind the element, which moves with it.")).changed() {
+                // Turned on, it starts white with no outline; the options below change it.
+                update(app, json!({"background": if on { json!({}) } else { Value::Null }}));
+            }
+            let Some(b) = e.background else { return };
+            egui::Grid::new(("layout_background", id)).num_columns(2).min_col_width(crate::textform::LABEL_W).spacing(vec2(8.0, 6.0)).show(
+                ui,
+                |ui| {
+                    for (label, key, current) in [("Fill", "fill", b.fill), ("Outline", "outline", b.outline)] {
+                        ui.label(tl!(label));
+                        let mut c = crate::theme::c32(current);
+                        let resp = crate::widgets::color_button(ui, &mut c);
+                        if resp.changed() {
+                            crate::widgets::one_step_per_press(app, &resp);
+                            update(app, json!({"background": {key: crate::theme::rgba(c).hex()}}));
+                        }
+                        ui.end_row();
+                    }
+                    for (label, key, drag_id, current, max, suffix) in [
+                        ("Outline width", "width", "background_width", b.width, MAX_BACKGROUND_WIDTH, " pt"),
+                        ("Corner radius", "radius", "background_radius", b.radius, MAX_BACKGROUND_RADIUS, " mm"),
+                        ("Padding", "padding", "background_padding", b.padding, MAX_BACKGROUND_PADDING, " mm"),
+                    ] {
+                        let input_label = ui.label(tl!(label));
+                        let mut v = current;
+                        let drag = Dragged::lend(ui, drag_key(drag_id), &mut v);
+                        let r = ui
+                            .add(
+                                egui::DragValue::new(&mut v)
+                                    .update_while_editing(false)
+                                    .range(0.0..=max)
+                                    .speed(0.1)
+                                    .max_decimals(1)
+                                    .suffix(suffix),
+                            )
+                            .labelled_by(input_label.id);
+                        if drag.settled(ui, &r, &mut v) && (v - current).abs() > 1e-6 {
+                            update(app, json!({"background": {key: v}}));
+                        }
+                        ui.end_row();
+                    }
+                },
+            );
         });
     }
     ui.add_space(8.0);

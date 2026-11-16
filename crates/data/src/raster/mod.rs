@@ -13,15 +13,18 @@ pub mod crs;
 pub(crate) mod epsg_axes;
 mod epsg_gap;
 mod esri;
+mod esri_datums;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gdal;
 pub mod geotiff;
 mod image_grid;
+mod lerc;
 mod lzw;
 mod mask;
 pub mod pam;
 pub mod planetary;
 pub mod wkt;
+pub mod world;
 pub mod zarr;
 
 use std::path::Path;
@@ -620,6 +623,10 @@ pub struct Raster {
     pub source: Option<String>,
     /// Whether the pixels come from a reduced-resolution overview.
     pub overview: Option<(u32, u32)>,
+    /// With `overview`, whether the pixels are every `step`-th of the file's, from its top-left
+    /// corner (a picture too large to read whole): each then spans exactly `step` of its pixels,
+    /// where an overview's span its size over the file's. 1 otherwise.
+    pub(crate) step: u32,
     /// `false` for a scan (a TIFF with no GeoTIFF tags, a PNG, a JPEG): `transform` is then only
     /// a stand-in until the picture is placed or georeferenced, and says nothing about the ground.
     pub georeferenced: bool,
@@ -731,7 +738,6 @@ pub fn gdal_metadata_changed(r: &Raster, bands: &[usize]) -> usize {
 
 impl Raster {
     /// Builds a raster from bands of `width × height` pixels and computes statistics.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: impl Into<String>,
         width: u32,
@@ -748,7 +754,6 @@ impl Raster {
 
     /// [`Raster::new`] without statistics (each band's are empty): a part of a larger raster,
     /// drawn with the whole's (a cloud-optimised GeoTIFF's view, read in place).
-    #[allow(clippy::too_many_arguments)]
     pub fn unmeasured(
         name: impl Into<String>,
         width: u32,
@@ -763,7 +768,6 @@ impl Raster {
         Raster::build(name, width, height, bands, transform, crs, nodata, color, data_type, false)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build(
         name: impl Into<String>,
         width: u32,
@@ -817,6 +821,7 @@ impl Raster {
             data_type,
             source: None,
             overview: None,
+            step: 1,
             georeferenced: true,
             lost: Vec::new(),
             rounded: Vec::new(),
@@ -895,6 +900,8 @@ impl Raster {
         let nd = self.nodata.map(|v| v as f32);
         let valid = move |v: f32| v.is_finite() && nd.is_none_or(|d| v != d);
         let overview = self.overview.is_some();
+        // Bands whose attribute table's class names aren't used: the file names their classes.
+        let mut unused_tables = 0usize;
         // Worked out before the bands change, as a colour band's take its alpha band's values.
         let (alpha, opaque) = (self.color.alpha(self.bands.len()), alpha_max(&self.data_type));
         let mut measured: Vec<Option<BandStats>> = (0..self.bands.len())
@@ -910,8 +917,13 @@ impl Raster {
             if let Some(d) = p.and_then(|p| p.description.as_ref()) {
                 band.name = d.clone();
             }
+            // A table's names don't replace those the file's own metadata gave.
             if let Some(p) = p.filter(|p| !p.categories.is_empty()) {
-                band.classes = p.categories.clone();
+                if p.from_table && !band.classes.is_empty() {
+                    unused_tables += 1;
+                } else {
+                    band.classes = p.categories.clone();
+                }
             }
             if let Some(w) = p.and_then(|p| p.wavelength) {
                 band.wavelength = Some(w);
@@ -920,74 +932,16 @@ impl Raster {
                 band.stats = stats;
             }
         }
+        if unused_tables > 0 {
+            self.lost.push(format!(
+                "{from}: {unused_tables} attribute table(s) of class names not read: the file's own metadata names those bands' classes"
+            ));
+        }
     }
 
     /// Longitude/latitude bounds, from points along the grid's edges.
     fn compute_extent(&self) -> Extent {
-        let mut e = Extent::EMPTY;
-        let (w, h) = (self.width as f64, self.height as f64);
-        let steps = 32;
-        let mut add = |col: f64, row: f64| {
-            if let Some(c) = self.transformer.to_lonlat_for_extent(self.transform.to_world(col, row)) {
-                e.expand(Coord::new(c.x, c.y.clamp(-90.0, 90.0)));
-            }
-        };
-        for i in 0..=steps {
-            let t = i as f64 / steps as f64;
-            for (col, row) in [(t * w, 0.0), (t * w, h), (0.0, t * h), (w, t * h)] {
-                add(col, row);
-            }
-        }
-        // Interior points too: in polar and other projections the grid can reach further than its
-        // edges do. (A raster crossing the antimeridian still gets a world-wide extent.)
-        let n = 16;
-        for i in 1..n {
-            for j in 1..n {
-                add(w * i as f64 / n as f64, h * j as f64 / n as f64);
-            }
-        }
-        // Normalize the transformed range as a whole, retaining its winding: a range crossing
-        // the antimeridian needs world-wide bounds to include both strips in a single Extent.
-        // A native full turn remains world-wide even if a datum shift contracts its samples.
-        if !e.is_empty() && self.transformer.is_geographic() && w * self.transform.pixel_width.abs() >= 360.0 {
-            (e.min_x, e.max_x) = (-180.0, 180.0);
-        } else if !e.is_empty() && (e.min_x < -180.0 || e.max_x > 180.0) {
-            let shift = 360.0 * ((e.min_x + 180.0) / 360.0).floor();
-            let (lo, hi) = (e.min_x - shift, e.max_x - shift);
-            (e.min_x, e.max_x) = if lo >= -180.0 && hi <= 180.0 { (lo, hi) } else { (-180.0, 180.0) };
-        }
-        // A whole world in a world projection RustGIS computes reaches the antimeridian and the
-        // poles at its outline's edge, which samples miss when the grid's edges are a little past
-        // it (its corners are off the outline): whatever of them is in the grid is in its extent
-        // (#1701).
-        if let Some(centre) = self.transformer.world_central_meridian().filter(|_| !e.is_empty()) {
-            let inside = |lon: f64, lat: f64| {
-                self.transformer.from_lonlat(Coord::new(lon, lat)).is_some_and(|m| {
-                    let (col, row) = self.transform.to_pixel(m);
-                    (-1e-6..=w + 1e-6).contains(&col) && (-1e-6..=h + 1e-6).contains(&row)
-                })
-            };
-            let along = |i: usize| -180.0 + 360.0 * i as f64 / steps as f64;
-            if (0..=steps).any(|i| inside(180.0, along(i) / 2.0)) {
-                e.max_x = 180.0;
-            }
-            if (0..=steps).any(|i| inside(-180.0, along(i) / 2.0)) {
-                e.min_x = -180.0;
-            }
-            if (0..=steps).any(|i| inside(along(i), 90.0)) {
-                e.max_y = 90.0;
-            }
-            if (0..=steps).any(|i| inside(along(i), -90.0)) {
-                e.min_y = -90.0;
-            }
-            // Centred elsewhere than on 0°, the outline's edges are another meridian than the
-            // antimeridian: the one opposite its centre, on either side of it.
-            let edge = (centre + 360.0).rem_euclid(360.0) - 180.0;
-            if edge.abs() < 180.0 - 1e-6 && (0..=steps).any(|i| [-1e-9, 1e-9].iter().any(|d| inside(edge + d, along(i) / 2.0))) {
-                (e.min_x, e.max_x) = (e.min_x.min(edge), e.max_x.max(edge));
-            }
-        }
-        e
+        extent_of(&self.transform, &self.transformer, self.width, self.height)
     }
 
     /// Refuses a raster with no coordinates, for the tools that would give their result a place
@@ -1039,6 +993,67 @@ impl Raster {
         }
         self.extent = extent;
         Ok(())
+    }
+
+    /// How many of the file's pixels one pixel read spans, across and down: exactly `step` for
+    /// every `step`-th pixel, an overview's size over the file's, else 1.
+    fn file_pixels(&self) -> (f64, f64) {
+        if self.step > 1 {
+            return (f64::from(self.step), f64::from(self.step));
+        }
+        let (full_w, full_h) = self.overview.unwrap_or((self.width, self.height));
+        (f64::from(full_w) / f64::from(self.width.max(1)), f64::from(full_h) / f64::from(self.height.max(1)))
+    }
+
+    /// A scan placed by its world file, in `crs`: georeferenced. The world file speaks of the
+    /// file's pixels, so a scan read at a reduced size keeps its place with pixels as much
+    /// larger. A rotated, skewed or mirrored one is resampled north up, as a rotated GeoTIFF is,
+    /// keeping its bands' names, classes and wavelengths. When it can't be placed (it would lie
+    /// nowhere it can be drawn, or be too large turned), the scan comes back unchanged with why.
+    pub fn placed_by_world_file(mut self, wf: &world::WorldFile, crs: Crs) -> std::result::Result<Raster, (Box<Raster>, String)> {
+        if self.georeferenced {
+            return Err((Box::new(self), "only a raster with no coordinates can be placed".into()));
+        }
+        let (sx, sy) = self.file_pixels();
+        let (affine, transformer) = match world_placement(wf, crs, self.width, self.height, (sx, sy)) {
+            Ok(placed) => placed,
+            Err(why) => return Err((Box::new(self), why)),
+        };
+        let mut r = if wf.is_north_up() {
+            self.transform = GeoTransform { origin_x: affine[0], origin_y: affine[3], pixel_width: affine[1], pixel_height: affine[5] };
+            self.crs = crs;
+            self.transformer = transformer;
+            self.extent = self.compute_extent();
+            self
+        } else {
+            // The bands are only read, so a picture that can't be turned comes back as it was.
+            let data: Vec<&[f32]> = self.bands.iter().map(|b| b.data.as_slice()).collect();
+            let (data, ow, oh, t) = match north_up(&data, self.width, self.height, affine, max_samples()) {
+                Ok(turned) => turned,
+                Err(e) => return Err((Box::new(self), e.to_string())),
+            };
+            let mut r = match Raster::new(self.name.clone(), ow, oh, data, t, crs, self.nodata, self.color.clone(), self.data_type.clone())
+            {
+                Ok(r) => r,
+                Err(e) => return Err((Box::new(self), e.to_string())),
+            };
+            // Each band keeps all it was but its pixels and their statistics.
+            for (new, mut old) in r.bands.iter_mut().zip(std::mem::take(&mut self.bands)) {
+                old.data = std::mem::take(&mut new.data);
+                old.stats = new.stats.clone();
+                *new = old;
+            }
+            // A picture read at a reduced size still says so, as a turned GeoTIFF does: of the
+            // turned grid at the file's resolution, so the two sizes said are alike.
+            let full = |n: u32, s: f64| (f64::from(n) * s).round().clamp(1.0, f64::from(u32::MAX)) as u32;
+            r.overview = self.overview.map(|_| (full(ow, sx), full(oh, sy)));
+            (r.source, r.lost, r.copyright) = (self.source, self.lost, self.copyright);
+            (r.rounded, r.rounded_some) = (self.rounded, self.rounded_some);
+            r
+        };
+        r.georeferenced = true;
+        r.step = 1;
+        Ok(r)
     }
 
     /// Longitude/latitude bounds.
@@ -1142,8 +1157,21 @@ impl Raster {
     }
 }
 
-/// Reads a raster file by path.
+/// Reads a raster file by path: a picture with a world file beside it placed by it (#2075).
 pub fn read_path(path: &Path) -> Result<Raster> {
+    read_path_placing(path, true)
+}
+
+/// [`read_path_with`] without the world file beside a picture: the picture as the file holds it,
+/// for one opened as a scan (`"as": "scan"`, or a layer laid over a placement reopened), so a
+/// world file that is there, or turns up later, doesn't place or resample it. A GDAL file's
+/// `subdataset` and `crs`, a Zarr store's variable, are read as [`read_path_with`] reads them.
+pub fn read_path_unplaced(path: &Path, subdataset: Option<&str>, crs: Option<&str>) -> Result<Raster> {
+    read_path_with_placing(path, subdataset, crs, false)
+}
+
+/// [`read_path`], applying a picture's world file when `world` is true.
+fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
     // A Zarr store is a folder: its first variable.
     #[cfg(not(target_arch = "wasm32"))]
     if zarr::is_store(path) {
@@ -1166,15 +1194,15 @@ pub fn read_path(path: &Path) -> Result<Raster> {
             #[cfg(not(target_arch = "wasm32"))]
             let r = geotiff::read_file_with_nodata(path, &name, sidecar_nodata)?;
             #[cfg(target_arch = "wasm32")]
-            let r = geotiff::read_with_nodata(std::io::BufReader::new(std::fs::File::open(path)?), &name, sidecar_nodata)?;
+            let r = geotiff::read_with_nodata(std::io::BufReader::new(crate::provenance::open(path)?), &name, sidecar_nodata)?;
             r
         }
-        "png" | "jpg" | "jpeg" => read_scan(&name, std::io::BufReader::new(std::fs::File::open(path)?))?,
+        "png" | "jpg" | "jpeg" => read_scan(&name, std::io::BufReader::new(crate::provenance::open(path)?))?,
         "asc" => {
             if meta.len() > MAX_ASCII_BYTES {
                 return Err(DataError::Format("the ASCII grid is too large to open".into()));
             }
-            let text = std::fs::read_to_string(path)?;
+            let text = crate::provenance::read_to_string(path)?;
             read_ascii(path, &text, &name, sidecar_nodata)?
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -1200,26 +1228,99 @@ pub fn read_path(path: &Path) -> Result<Raster> {
         // The second read gives all the first did: the first goes before it, so two aren't held.
         drop(r);
         r = if ext == "asc" {
-            read_ascii(path, &std::fs::read_to_string(path)?, &name, nd)?
+            read_ascii(path, &crate::provenance::read_to_string(path)?, &name, nd)?
         } else {
             #[cfg(not(target_arch = "wasm32"))]
             let again = geotiff::read_file_with_nodata(path, &name, nd)?;
             #[cfg(target_arch = "wasm32")]
-            let again = geotiff::read_with_nodata(std::io::BufReader::new(std::fs::File::open(path)?), &name, nd)?;
+            let again = geotiff::read_with_nodata(std::io::BufReader::new(crate::provenance::open(path)?), &name, nd)?;
             again
         };
     }
     if let Some(p) = &pam {
         r.apply_pam(p, pam::SIDECAR);
     }
+    if world && matches!(ext.as_str(), "tif" | "tiff" | "png" | "jpg" | "jpeg") {
+        r = apply_world_file(path, r);
+    }
     r.source = Some(path.display().to_string());
     Ok(r)
+}
+
+/// A picture at `path` with the world file beside it applied (#2075). A scan is placed by it, in
+/// the coordinate system of the `.prj` beside it. Whatever goes wrong (no `.prj`, one that can't
+/// be used, a world file that can't be read, or one that places it nowhere it can be drawn), the
+/// picture still opens as the scan it was, and a notice says why. A GeoTIFF keeps its own tags,
+/// and says so when the world file places it differently.
+pub fn apply_world_file(path: &Path, mut r: Raster) -> Raster {
+    let Some((found, read)) = world::beside(path) else { return r };
+    let name = found.file_name().map_or_else(|| found.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let unplaced = "it opens without coordinates";
+    let wf = match read {
+        Ok(wf) => wf,
+        Err(e) => {
+            let then = if r.georeferenced { "the GeoTIFF's own coordinates are used" } else { unplaced };
+            r.lost.push(format!("the world file {name} can't be read ({e}): {then}"));
+            return r;
+        }
+    };
+    if r.georeferenced {
+        if !world_file_agrees(&r, &wf) {
+            r.lost.push(format!("the world file {name} places it differently from the GeoTIFF's own tags, which are used"));
+        }
+        return r;
+    }
+    let (crs, note) = match sidecar_crs(path) {
+        Ok(found) => found,
+        Err(e) => {
+            r.lost.push(format!("the world file {name} isn't used ({e}): {unplaced}"));
+            return r;
+        }
+    };
+    let Some(crs) = crs else {
+        let why = note.map_or_else(String::new, |n| format!(" (the .prj file: {n})"));
+        r.lost.push(format!(
+            "the world file {name} places it, but no .prj beside it says the coordinate system{why}: {unplaced}; put a .prj next to it and add it again"
+        ));
+        return r;
+    };
+    match r.placed_by_world_file(&wf, crs) {
+        Ok(mut r) => {
+            r.lost.extend(note.map(|n| format!("the .prj file: {n}")));
+            r
+        }
+        Err((r, why)) => {
+            let mut r = *r;
+            r.lost.push(format!("the world file {name} isn't used ({why}): {unplaced}"));
+            r
+        }
+    }
+}
+
+/// Whether a world file places a GeoTIFF where its tags do: the same corner and pixel size, to a
+/// thousandth of a pixel (at the file's resolution). A turned world file isn't compared: a turned
+/// GeoTIFF is resampled north up as it is read, so its tags can't be compared with one, and
+/// nothing is claimed.
+fn world_file_agrees(r: &Raster, wf: &world::WorldFile) -> bool {
+    if !wf.is_north_up() {
+        return true;
+    }
+    let (sx, sy) = r.file_pixels();
+    let t = r.transform;
+    let (pw, ph) = (t.pixel_width / sx, t.pixel_height / sy);
+    let [x0, xc, _, y0, _, yr] = wf.affine();
+    let close = |a: f64, b: f64, unit: f64| (a - b).abs() <= unit.abs() * 1e-3;
+    close(xc, pw, pw) && close(yr, ph, ph) && close(x0, t.origin_x, pw) && close(y0, t.origin_y, ph)
 }
 
 /// Reads a raster file, with the GDAL choices a raster GDAL reads may have been added with: its
 /// subdataset (a NetCDF variable) and the coordinate system it doesn't say. Other files ignore
 /// them.
 pub fn read_path_with(path: &Path, subdataset: Option<&str>, crs: Option<&str>) -> Result<Raster> {
+    read_path_with_placing(path, subdataset, crs, true)
+}
+
+fn read_path_with_placing(path: &Path, subdataset: Option<&str>, crs: Option<&str>, world: bool) -> Result<Raster> {
     // A Zarr store's variable and slice (`t2m[time=3]`).
     #[cfg(not(target_arch = "wasm32"))]
     if zarr::is_store(path) {
@@ -1230,19 +1331,39 @@ pub fn read_path_with(path: &Path, subdataset: Option<&str>, crs: Option<&str>) 
         return read_converted(path, &gdal::convert(path, subdataset, crs)?);
     }
     let _ = (subdataset, crs);
-    read_path(path)
+    read_path_placing(path, world)
 }
 
 /// Reads the GeoTIFF GDAL converted `path` to, named and sourced as `path` (and its subdataset).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_converted(path: &Path, c: &gdal::Converted) -> Result<Raster> {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("raster");
-    let mut r = geotiff::read_file(&c.path, stem)?;
+    crate::provenance::path(path);
+    let mut r = crate::provenance::without(|| geotiff::read_file(&c.path, stem))?;
     if let Some(s) = &c.subdataset {
         r.name = format!("{stem} {}", gdal::short_name(s));
     }
     r.source = Some(path.display().to_string());
+    // What converting found that the GeoTIFF it made doesn't say (that file names the system GDAL
+    // assumed as if it had been the file's own): said with the raster's other losses, whichever way
+    // it is read, as a reload says them again.
+    if c.assumed_lonlat {
+        r.lost.push(format!("{} (give \"crs\" if not)", assumed_wgs84_note("it doesn't say its coordinate system")));
+    }
+    if !c.others.is_empty() {
+        let shown: Vec<&str> = c.others.iter().take(20).map(String::as_str).collect();
+        let more = c.others.len().saturating_sub(shown.len());
+        let tail = if more > 0 { format!(", and {more} more") } else { String::new() };
+        r.lost.push(format!("it has {} more variables ({}{tail}): add one with \"layer\"", c.others.len(), shown.join(", ")));
+    }
     Ok(r)
+}
+
+/// What a reader says when a grid whose file gives no usable coordinate system is read as WGS 84
+/// longitude/latitude, because its coordinates fit in degrees (AGENTS.md, Never silent): `why` is
+/// what the file lacks or gets wrong. One line a raster, whatever its size.
+pub(crate) fn assumed_wgs84_note(why: &str) -> String {
+    format!("{why}; its coordinates look like longitude/latitude, so it's read as WGS 84")
 }
 
 /// The stand-in transform of a scan of `w` × `h` pixels: square pixels, the longer side one degree,
@@ -1345,6 +1466,7 @@ fn read_scan_limited<R: std::io::BufRead + std::io::Seek>(name: &str, mut source
     let mut r = Raster::new(name, ow, oh, bands, unreferenced(ow, oh), Crs::LonLat, None, color, data_type)?;
     r.georeferenced = false;
     r.overview = (k > 1).then_some((w, h));
+    r.step = k;
     Ok(r)
 }
 
@@ -1407,7 +1529,7 @@ fn rotate(r: &Raster, degrees: f64) -> Result<Raster> {
 /// row, y, y per column, y per row), resampled (nearest pixel) to the north-up grid of square
 /// pixels over its bounding box: pixels of the same area, coarser if that would hold more than
 /// `max` samples. Outside the image is NaN (transparent). Returns the bands, their size and grid.
-fn north_up(bands: Vec<Vec<f32>>, w: u32, h: u32, affine: [f64; 6], max: usize) -> Result<(Vec<Vec<f32>>, u32, u32, GeoTransform)> {
+fn north_up<B: AsRef<[f32]>>(bands: &[B], w: u32, h: u32, affine: [f64; 6], max: usize) -> Result<(Vec<Vec<f32>>, u32, u32, GeoTransform)> {
     let [x0, xc, xr, y0, yc, yr] = affine;
     let det = xc * yr - xr * yc;
     if !affine.iter().all(|v| v.is_finite()) || !det.is_normal() {
@@ -1447,8 +1569,8 @@ fn north_up(bands: Vec<Vec<f32>>, w: u32, h: u32, affine: [f64; 6], max: usize) 
             }
             let src = r as usize * w as usize + c as usize;
             let dst = row as usize * ow as usize + col as usize;
-            for (o, b) in out.iter_mut().zip(&bands) {
-                if let (Some(o), Some(v)) = (o.get_mut(dst), b.get(src)) {
+            for (o, b) in out.iter_mut().zip(bands) {
+                if let (Some(o), Some(v)) = (o.get_mut(dst), b.as_ref().get(src)) {
                     *o = *v;
                 }
             }
@@ -1510,13 +1632,13 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<Raster> {
 /// An ASCII grid at `path` (its `text`), in the coordinate system of the `.prj` next to it.
 fn read_ascii(path: &Path, text: &str, name: &str, nodata: Option<f64>) -> Result<Raster> {
     let (crs, note) = sidecar_crs(path)?;
-    let mut r = ascii::read_with_nodata(text, name, crs, nodata)?;
-    // Planetary body notices have their own path. Preserve the method warning without duplicating
-    // those, and only assume lon/lat for an unreadable definition.
-    r.lost.extend(note.map(|message| match crs {
-        Some(_) => format!("the .prj file: {message}"),
-        None => format!("the .prj file: {message}; coordinates are read as longitude/latitude"),
-    }));
+    let note = note.map(|message| format!("the .prj file: {message}"));
+    // An unreadable definition explains the assumption itself; a missing definition says it is
+    // missing. A readable system keeps its other notes, without repeating the planetary body.
+    let mut r = ascii::read_with_nodata(text, name, crs, nodata, note.as_deref().filter(|_| crs.is_none()))?;
+    if crs.is_some() {
+        r.lost.extend(note);
+    }
     Ok(r)
 }
 
@@ -1527,7 +1649,7 @@ fn read_ascii(path: &Path, text: &str, name: &str, nodata: Option<f64>) -> Resul
 fn sidecar_crs(path: &Path) -> Result<(Option<Crs>, Option<String>)> {
     let Some(prj) = read_prj(path) else {
         // One that is there but can't be read as text (not UTF-8, too large to be one) is said too.
-        let there = std::fs::metadata(path.with_extension("prj")).is_ok_and(|m| m.is_file());
+        let there = prj_path(path).is_some();
         return Ok((None, there.then(|| "it can't be read as text".to_string())));
     };
     match wkt::read_wkt(&prj) {
@@ -1545,14 +1667,132 @@ fn sidecar_crs(path: &Path) -> Result<(Option<Crs>, Option<String>)> {
     }
 }
 
+/// Whether a world file lays a `w` × `h` picture somewhere on Earth in `crs`: its corners convert,
+/// and in a geographic system lie within the poles and at longitudes wrapping explains (the
+/// check [`Raster::placed_by_world_file`] makes, on the corners alone, without the pixels).
+pub(crate) fn lands_on_earth(wf: &world::WorldFile, crs: Crs, w: u32, h: u32) -> bool {
+    world_placement(wf, crs, w, h, (1.0, 1.0)).is_ok()
+}
+
+/// Where a world file lays a `w` × `h` picture whose pixels each span `(sx, sy)` of the file's, in
+/// `crs`: the affine of those pixels' corners (GDAL's order) and the system's transformer, or why
+/// it lays the picture nowhere it can be drawn. Checked on the box of its corners, before any
+/// pixel moves: the grid over it must be valid with an extent, and in a geographic system its
+/// corners within the poles and at longitudes wrapping explains, since the extent clamps
+/// latitudes and wraps longitudes and can't show numbers in another system (UTM meters with a
+/// longitude/latitude .prj).
+fn world_placement(
+    wf: &world::WorldFile,
+    crs: Crs,
+    w: u32,
+    h: u32,
+    (sx, sy): (f64, f64),
+) -> std::result::Result<([f64; 6], Transformer), String> {
+    let transformer = crs.transformer()?;
+    let [x0, xc, xr, y0, yc, yr] = wf.affine();
+    let affine = [x0, xc * sx, xr * sy, y0, yc * sx, yr * sy];
+    let (fw, fh) = (f64::from(w), f64::from(h));
+    let corners = [(0.0, 0.0), (fw, 0.0), (0.0, fh), (fw, fh)]
+        .map(|(c, r)| (affine[0] + c * affine[1] + r * affine[2], affine[3] + c * affine[4] + r * affine[5]));
+    let (min_x, max_x) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), (x, _)| (a.min(*x), b.max(*x)));
+    let (min_y, max_y) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), (_, y)| (a.min(*y), b.max(*y)));
+    let boxed = GeoTransform {
+        origin_x: min_x,
+        origin_y: max_y,
+        pixel_width: (max_x - min_x) / fw.max(1.0),
+        pixel_height: -(max_y - min_y) / fh.max(1.0),
+    };
+    let on_earth = !transformer.is_geographic() || (min_y >= -90.5 && max_y <= 90.5 && min_x >= -540.0 && max_x <= 540.0);
+    if !boxed.is_valid() || !on_earth || extent_of(&boxed, &transformer, w, h).is_empty() {
+        return Err(format!("it places the picture nowhere it can be drawn in {}", crs.label()));
+    }
+    Ok((affine, transformer))
+}
+
+/// The `.prj` next to a file, in lower or upper case (`.PRJ`, beside an `IMAGE.TFW`), for file
+/// systems that tell them apart.
+fn prj_path(path: &Path) -> Option<std::path::PathBuf> {
+    ["prj", "PRJ"].into_iter().map(|e| path.with_extension(e)).find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+}
+
 /// The text of the `.prj` next to a file (`None` when there's none, or it's too large to be one).
 pub fn read_prj(path: &Path) -> Option<String> {
-    let prj = path.with_extension("prj");
+    let prj = prj_path(path)?;
     let meta = std::fs::metadata(&prj).ok()?;
     if !meta.is_file() || meta.len() > 1 << 20 {
         return None;
     }
-    std::fs::read_to_string(prj).ok()
+    crate::provenance::read_to_string(prj).ok()
+}
+
+/// Longitude/latitude bounds of a `width` × `height` grid placed by `transform` in `transformer`'s
+/// system, from points along its edges and inside it ([`Raster::compute_extent`]): also for a
+/// placement checked before any pixel is moved.
+fn extent_of(transform: &GeoTransform, transformer: &Transformer, width: u32, height: u32) -> Extent {
+    let mut e = Extent::EMPTY;
+    let (w, h) = (width as f64, height as f64);
+    let steps = 32;
+    let mut add = |col: f64, row: f64| {
+        if let Some(c) = transformer.to_lonlat_for_extent(transform.to_world(col, row)) {
+            e.expand(Coord::new(c.x, c.y.clamp(-90.0, 90.0)));
+        }
+    };
+    for i in 0..=steps {
+        let t = i as f64 / steps as f64;
+        for (col, row) in [(t * w, 0.0), (t * w, h), (0.0, t * h), (w, t * h)] {
+            add(col, row);
+        }
+    }
+    // Interior points too: in polar and other projections the grid can reach further than its
+    // edges do. (A raster crossing the antimeridian still gets a world-wide extent.)
+    let n = 16;
+    for i in 1..n {
+        for j in 1..n {
+            add(w * i as f64 / n as f64, h * j as f64 / n as f64);
+        }
+    }
+    // Normalize the transformed range as a whole, retaining its winding: a range crossing
+    // the antimeridian needs world-wide bounds to include both strips in a single Extent.
+    // A native full turn remains world-wide even if a datum shift contracts its samples.
+    if !e.is_empty() && transformer.is_geographic() && w * transform.pixel_width.abs() >= 360.0 {
+        (e.min_x, e.max_x) = (-180.0, 180.0);
+    } else if !e.is_empty() && (e.min_x < -180.0 || e.max_x > 180.0) {
+        let shift = 360.0 * ((e.min_x + 180.0) / 360.0).floor();
+        let (lo, hi) = (e.min_x - shift, e.max_x - shift);
+        (e.min_x, e.max_x) = if lo >= -180.0 && hi <= 180.0 { (lo, hi) } else { (-180.0, 180.0) };
+    }
+    // A whole world in Natural Earth, Winkel Tripel or Eckert IV reaches the antimeridian and the
+    // poles at its outline's edge, which samples miss when the grid's edges are a little past
+    // it (its corners are off the outline): whatever of them is in the grid is in its extent
+    // (#1701).
+    if let Some(centre) = transformer.world_central_meridian().filter(|_| !e.is_empty()) {
+        let inside = |lon: f64, lat: f64| {
+            transformer.from_lonlat(Coord::new(lon, lat)).is_some_and(|m| {
+                let (col, row) = transform.to_pixel(m);
+                (-1e-6..=w + 1e-6).contains(&col) && (-1e-6..=h + 1e-6).contains(&row)
+            })
+        };
+        let along = |i: usize| -180.0 + 360.0 * i as f64 / steps as f64;
+        if (0..=steps).any(|i| inside(180.0, along(i) / 2.0)) {
+            e.max_x = 180.0;
+        }
+        if (0..=steps).any(|i| inside(-180.0, along(i) / 2.0)) {
+            e.min_x = -180.0;
+        }
+        if (0..=steps).any(|i| inside(along(i), 90.0)) {
+            e.max_y = 90.0;
+        }
+        if (0..=steps).any(|i| inside(along(i), -90.0)) {
+            e.min_y = -90.0;
+        }
+        // Centred elsewhere than on 0°, the outline's edges are another meridian than the
+        // antimeridian: the one opposite its centre, on either side of it.
+        let edge = (centre + 360.0).rem_euclid(360.0) - 180.0;
+        if edge.abs() < 180.0 - 1e-6 && (0..=steps).any(|i| [-1e-9, 1e-9].iter().any(|d| inside(edge + d, along(i) / 2.0))) {
+            (e.min_x, e.max_x) = (e.min_x.min(edge), e.max_x.max(edge));
+        }
+    }
+    e
 }
 
 #[cfg(test)]
@@ -1814,6 +2054,38 @@ pub(crate) mod tests {
         std::fs::write(dir.join("dem.tif.aux.xml"), "<PAMDataset><PAMRasterBand").unwrap();
         assert_eq!(read_path(&tif).unwrap().bands[0].name, "Band 1");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gdal_sidecars_name_classes_from_an_attribute_table() {
+        let dir = std::env::temp_dir().join(format!("rustgis-pam-rat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gt = GeoTransform { origin_x: 10.0, origin_y: 50.0, pixel_width: 0.5, pixel_height: -0.5 };
+        let r = Raster::new("lc", 2, 2, vec![vec![1.0, 3.0, 3.0, 1.0]], gt, Crs::LonLat, None, ColorHint::Gray, "UInt8").unwrap();
+        let tif = dir.join("lc.tif");
+        std::fs::write(&tif, geotiff::write(&r, 0).unwrap()).unwrap();
+        let xml = r#"<PAMDataset><PAMRasterBand band="1"><GDALRasterAttributeTable Row0Min="0" BinSize="1">
+<FieldDefn index="0"><Name>Value</Name><Type>0</Type><Usage>5</Usage></FieldDefn>
+<FieldDefn index="1"><Name>Class_Name</Name><Type>2</Type><Usage>2</Usage></FieldDefn>
+<Row index="0"><F>1</F><F>Water</F></Row><Row index="1"><F>3</F><F>Forest</F></Row>
+</GDALRasterAttributeTable></PAMRasterBand></PAMDataset>"#;
+        std::fs::write(dir.join("lc.tif.aux.xml"), xml).unwrap();
+        let back = read_path(&tif).unwrap();
+        let b = &back.bands[0];
+        assert_eq!(b.classes, ["", "Water", "", "Forest"]);
+        assert_eq!((b.class_name(1.0), b.class_name(3.0), b.class_name(2.0)), (Some("Water"), Some("Forest"), None));
+        assert!(back.lost.is_empty(), "{:?}", back.lost);
+        // Class names the GeoTIFF gives itself are kept over the table's, and that is said.
+        let mut named = r.clone();
+        named.bands[0].classes = vec![String::new(), "Lake".into()];
+        std::fs::write(&tif, geotiff::write(&named, 0).unwrap()).unwrap();
+        let own = read_path(&tif).unwrap();
+        assert_eq!(own.bands[0].classes, ["", "Lake"]);
+        assert_eq!(
+            own.lost,
+            ["its .aux.xml sidecar: 1 attribute table(s) of class names not read: the file's own metadata names those bands' classes"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2087,6 +2359,80 @@ pub(crate) mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// An ASCII grid on disk says it is read as WGS 84 when no `.prj` gives its system, and says
+    /// nothing when one does; a `.prj` that can't be read adds why, and the assumption is said once.
+    #[test]
+    fn an_ascii_grid_on_disk_says_what_its_prj_leaves_out() {
+        let dir = std::env::temp_dir().join(format!("rustgis-ascii-assumed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asc = dir.join("g.asc");
+        std::fs::write(&asc, "ncols 2\nnrows 1\nxllcorner 10\nyllcorner 40\ncellsize 1\n1 2\n").unwrap();
+        let r = read_path(&asc).unwrap();
+        assert_eq!(r.crs, Crs::LonLat);
+        assert_eq!(r.lost.len(), 1, "{:?}", r.lost);
+        assert!(r.lost[0].contains("doesn't say its coordinate system") && r.lost[0].contains("WGS 84"), "{:?}", r.lost);
+        std::fs::write(dir.join("g.prj"), wkt::to_wkt(Crs::LonLat).unwrap()).unwrap();
+        let r = read_path(&asc).unwrap();
+        assert!(r.lost.is_empty(), "{:?}", r.lost);
+        std::fs::write(dir.join("g.prj"), "not a coordinate system").unwrap();
+        let r = read_path(&asc).unwrap();
+        assert_eq!(r.lost.len(), 1, "{:?}", r.lost);
+        let note = &r.lost[0];
+        assert!(note.starts_with("the .prj file: ") && note.contains("so it's read as WGS 84"), "{note}");
+        assert!(!note.contains("it doesn't say its coordinate system"), "{note}");
+        std::fs::write(&asc, "ncols 2\nnrows 1\nxllcorner 1000\nyllcorner 4000\ncellsize 1\n1 2\n").unwrap();
+        let error = read_path(&asc).unwrap_err().to_string();
+        assert!(error.contains("the .prj file:") && error.contains("unknown coordinate system"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What GDAL's conversion found (a coordinate system it assumed, variables it didn't add) stays
+    /// with the raster read from the converted file, whichever way it is read; a conversion that found
+    /// nothing says nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_converted_raster_keeps_what_converting_found() {
+        let dir = std::env::temp_dir().join(format!("rustgis-converted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gt = GeoTransform { origin_x: 10.0, origin_y: 41.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let made = Raster::new("g", 2, 1, vec![vec![1.0, 2.0]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let tif = dir.join("converted.tif");
+        std::fs::write(&tif, geotiff::write(&made, 0).unwrap()).unwrap();
+        let lossy = gdal::Converted {
+            path: tif.clone(),
+            subdataset: Some("temperature".into()),
+            others: vec!["pressure".into(), "wind".into()],
+            assumed_lonlat: true,
+        };
+        let r = read_converted(Path::new("/data/climate.nc"), &lossy).unwrap();
+        assert_eq!(r.lost.len(), 2, "{:?}", r.lost);
+        assert!(
+            r.lost.iter().any(|n| n.contains("doesn't say its coordinate system") && n.contains("WGS 84") && n.contains("\"crs\"")),
+            "{:?}",
+            r.lost
+        );
+        assert!(r.lost.iter().any(|n| n.contains("pressure") && n.contains("wind") && n.contains("\"layer\"")), "{:?}", r.lost);
+        // Past the 20 names shown, the count of the rest is said too.
+        let many = gdal::Converted {
+            path: tif.clone(),
+            subdataset: None,
+            others: (1..=35).map(|i| format!("band{i}")).collect(),
+            assumed_lonlat: false,
+        };
+        let r = read_converted(Path::new("/data/climate.nc"), &many).unwrap();
+        assert!(
+            r.lost
+                .iter()
+                .any(|n| n.contains("35 more variables") && n.contains("band20") && !n.contains("band21") && n.contains("and 15 more")),
+            "{:?}",
+            r.lost
+        );
+        let clean = gdal::Converted { path: tif, subdataset: None, others: Vec::new(), assumed_lonlat: false };
+        let r = read_converted(Path::new("/data/climate.nc"), &clean).unwrap();
+        assert!(r.lost.is_empty(), "{:?}", r.lost);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -2236,7 +2582,7 @@ mod scan_tests {
 /// <https://source.coop/giswqs/opengeos>): `cargo test -p rustgis-data -- --ignored samples`.
 #[cfg(test)]
 #[test]
-#[ignore]
+#[ignore = "needs external raster samples in RUSTGIS_SAMPLE_RASTERS"]
 fn samples() {
     let Ok(dir) = std::env::var("RUSTGIS_SAMPLE_RASTERS") else { return };
     let mut paths: Vec<_> =

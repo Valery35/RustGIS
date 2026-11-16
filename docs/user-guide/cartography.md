@@ -34,7 +34,10 @@ Select a layer in Layers and open **Style › Symbology** (or the Symbology pane
   (`layer.symbology={"type": "unique", "expression": "…"}`).
 - **Graduated Colors**: 1 to 12 classes of a numeric field by natural breaks (Jenks), equal
   interval, quantile, geometric interval, standard deviation, arithmetic progression or head/tail
-  breaks (the Method list is in alphabetical order). Geometric interval makes class
+  breaks (the Method list is in alphabetical order). Quantile sorts the values and places each
+  class's upper bound at an **observed value**, without interpolation between values. It aims for
+  similar record counts per class; ties can give unequal counts or fewer distinct classes.
+  Geometric interval makes class
   widths grow by one ratio, for values piled up at the low end; for a field that reaches zero or
   below, the minimum is taken as if it sat at a hundredth of the range, so the widths grow by
   101^(1/classes). Standard deviation makes classes one deviation wide about the mean, and leaves
@@ -578,7 +581,8 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   installed families, `{"font": ""}` goes back to the label font).
 - **SQL**: label only the features that match a SQL clause (the language of definition
   queries), such as `pop_max > 5000000`. In the Labeling pane, Class › **SQL** › **New
-  expression**: write the clause (the field and operator buttons add to it), **Check** says
+  expression**: write the clause (the field and operator buttons, and the **Functions** and
+  **Variables** menus, add to it), **Check** says
   whether it reads and how many of the features the layer draws at the map's scale match
   (after its definition query, display filters and time window), and **Apply** sets it in one
   undo step; **Clear** removes the chosen class's clause, leaving other classes unchanged
@@ -677,9 +681,15 @@ ribbon and the layer's right-click menu. A tab per topic shows one part at a tim
 - **Display**: the visibility range (**Out Beyond**, **In Beyond**, **Clear Limits**),
   **Transparency**, **Masking**, a raster's **Layer Blend** or a feature layer's **Reference
   scale**, and the **Depth priority** that View › Scene › Raise and Lower Priority change (a
-  higher one draws on top, whatever the layer order).
+  higher one draws on top, whatever the layer order). A polygon layer also has its
+  **Extrusion**, as Style › Extrusion, Faces and Light and Shadow set it: the **Type** (None,
+  Constant height or By a numeric field) and, once extruded, the **Height (m)** of a constant
+  height (the ribbon sets 50 km), **Factor**, **Base** with **Base (m)**, **Face Culling**,
+  **Lighting** and **Cast Shadow**. Each change undoes on its own.
 - **Query**, for a feature layer: its definition query, the SQL clause the features must match to
-  draw (the grammar is in [Expressions](expressions.md)). Buttons add a field or an operator, a red
+  draw (the grammar is in [Expressions](expressions.md)). Buttons add a field or an operator, and
+  the **Functions** and **Variables** menus add a function (left open for its arguments, with what
+  it gives on hover) or a variable such as `$area`; a red
   line says what is wrong with a clause as you type it, **Apply** (or Ctrl+Enter) sets it and
   **Clear** draws every feature again. A clause being typed is kept while you look at another tab;
   choosing another layer or Escape in the box drops it.
@@ -707,6 +717,35 @@ range); **Aggregation** draws points as hexagon or square bins coloured by count
 **Factor**, with **Face Culling**, **Lighting** and **Cast Shadow** controls. It draws in an
 oblique view on an untilted flat map and in perspective on a tilted map; the globe draws the
 polygons flat. See [Rotating and tilting the map](maps.md#navigating).
+
+An extrusion can stand on a **base**: its walls rise from the base to the base plus the height,
+so a balcony or a bridge floats above the ground. The base is a numeric field's value (such as the
+`base_height` the CityGML and CityJSON readers give each part), else a constant in metres, both
+multiplied by the same **Factor** as the height. A value that is no number takes the constant,
+and a negative base is the ground. Shadows fall from the base, roof labels sit at the top, and a
+web scene (**Publish › Share As › Web Scene**) raises the parts too. Once a layer is extruded,
+**Style › Extrusion › Base** chooses **Ground** (which also sets **Base (m)** to 0), a field
+(**By base_height**), or the constant **Base (m)** sets, listed once it is above 0; neither changes
+the height or the factor. The `layer.extrusionBase` command does the same (`field`, `base`;
+`"field": null` clears the field). Turning extrusion off drops the base with it. Without a tilt,
+and on a tilted map drawn without the graphics card, extrusions are painted in the order they
+stand on the ground, so a part raised over a building behind it may be painted under it.
+
+A city model (CityJSON or CityGML) comes in standing: when it is added, the polygon layers of its
+volumes are extruded by `height` on `base_height`, and its surfaces stay flat (see
+[Data formats](data-formats.md), CityJSON). **Style › Extrusion › Type › None** turns one off, and undo
+takes the layers away with their extrusion. Other data with the same fields comes in flat.
+
+Layers that go together, such as a city model's layers, are raised at once: pick them in the
+Layers pane, right-click one of them and choose **Extrusion › None** or **By** a numeric field
+every one of them has (**By height**) and, once all are extruded, **Extrusion Base › Ground** or
+**By** a field (**By base_height**).
+It acts on their polygon layers and says so when the others are left out, sets every one alike in
+one step to undo, and leaves each one's height, factor and base as they were where the choice
+doesn't set them. `layer.extrusion` and `layer.extrusionBase` take a list of layers in `layer`
+for the same. A layer that isn't polygons, a field that one of them lacks, or (for the base) one
+that isn't extruded yet refuses the whole list and changes none; the message names those layers
+(a list whose first layer isn't polygons is refused as that one layer would be).
 
 For a raster layer, the **Style** tab also has **Layer Blend** (multiply, screen, overlay,
 darken, lighten, difference), **Swipe** (the layer shows only left of a divider you slide, to

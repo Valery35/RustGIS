@@ -7,7 +7,7 @@ use egui::{Align2, CornerRadius, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::Session;
 use rustgis_engine::analysis::{ParamKind, tools};
 use rustgis_engine::data::GeometryType;
-use rustgis_engine::map::raster::{Normalizer, RasterLegend, RasterStyle};
+use rustgis_engine::map::raster::{Normalizer, RasterLegend, RasterStyle, Rock, relief_ambient};
 use rustgis_engine::map::symbology::{
     ClassRef, ClassStyle, Dash, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, MAX_EXPRESSION_CLASSES, MAX_LABEL,
     MAX_LINE_MARKER_SIZE, MAX_MARKER_INTERVAL, MAX_STROKE_OFFSET, MAX_STROKE_WIDTH, MAX_STROKES, MIN_MARKER_INTERVAL, OTHER_VALUES,
@@ -947,7 +947,7 @@ fn source_name(src: &str) -> SourceName {
         // a path, its %-escapes decoded.
         if scheme == "file" || host.is_empty() {
             let path = if host.eq_ignore_ascii_case("localhost") { rest.find('/').and_then(|i| rest.get(i..)).unwrap_or("") } else { rest };
-            return path_name(&percent_decoded(path));
+            return path_name(&rustgis_engine::data::address::percent_decode(path));
         }
         // Only the host ignores case: a database's name doesn't.
         let db = DATABASE_SCHEMES
@@ -959,30 +959,6 @@ fn source_name(src: &str) -> SourceName {
         return SourceName { key, label: name.clone(), hover: name };
     }
     path_name(src)
-}
-
-/// `%XX` escapes in a `file://` path decoded (`My%20Data.gpkg` is `My Data.gpkg`); a `%` not
-/// followed by two hex digits stays as it is.
-fn percent_decoded(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        // Two hex digits exactly (`from_str_radix` alone would take a sign).
-        let digits = b.get(i + 1..i + 3).filter(|h| h.iter().all(u8::is_ascii_hexdigit));
-        let hex = digits.and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
-        match (c, hex) {
-            (b'%', Some(v)) => {
-                out.push(v);
-                i += 3;
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A path as a source group: its last part, with the whole path as hover text.
@@ -1276,7 +1252,6 @@ fn service_group_row(
 /// Under it, indented, its layers and subgroups (#836) in drawing order; `depth` is its level (1
 /// at the top). With `reorder` the row drags the whole group, and it and its layers' rows join
 /// `rows`, where layers drop (see [`layer_drop`]).
-#[allow(clippy::too_many_arguments)]
 fn layer_group_row(
     app: &mut RustGisApp,
     ui: &mut Ui,
@@ -1905,6 +1880,48 @@ fn disk_note(app: &RustGisApp, layer: Option<&Layer>, tile: Option<usize>) -> Op
     }
 }
 
+/// The note after a layer's name, its details and tint, as [`disk_note`] gives them. A layer read
+/// whole from a Shapefile or GeoJSON file it publishes to (`source.publish`) also says whether it
+/// holds edits the file lacks (`syncmark`), and its file's changes point to Publish to Source,
+/// which refuses to overwrite them, rather than Reload Data, which can't read it again.
+pub(crate) fn layer_note(app: &mut RustGisApp, l: &Layer, ctx: &egui::Context) -> Option<(String, String, Option<bool>)> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::diskwatch::Status;
+        if !crate::diskwatch::publishes(l) || crate::diskwatch::reloadable(l) {
+            return disk_note(app, Some(l), None);
+        }
+        let edited = crate::syncmark::edited(app, l, ctx) == Some(true);
+        let status = if app.watch_files { crate::diskwatch::layer_status(app, l) } else { Status::Unchanged };
+        let unpublished = tl!("This layer has edits its file doesn't have yet. Publish to Source writes them to the file.");
+        match (status, edited) {
+            (Status::Changed, true) => Some((
+                tl!("(edits not published, changed on disk)").to_string(),
+                tl!("This layer has edits its file doesn't have, and the file changed on disk since it was read. Publish to Source refuses rather than overwrite that change; Export Features keeps the edits in a new file.").to_string(),
+                Some(false),
+            )),
+            (Status::Changed, false) => Some((
+                tl!("(changed on disk)").to_string(),
+                tl!("Changed on disk: the file may have changed since it was read. Add it again to see the change; Source File State checks it.").to_string(),
+                Some(false),
+            )),
+            (Status::Unchanged | Status::Folder, true) => Some((tl!("(edits not published)").to_string(), unpublished.to_string(), None)),
+            // Missing or unreadable: Publish refuses a file unlike its record, so edits can only be
+            // exported until it's back.
+            (status, edited) => crate::diskwatch::row_note(&status, false).map(|(note, detail, tint)| {
+                let blocked = tl!("This layer has edits its file doesn't have. Publish to Source can't write them until the file is back as it was read; Export Features keeps them in a new file.");
+                let detail = if edited { crate::i18n::fmt("{detail}\n{blocked}", &[("detail", &detail), ("blocked", blocked)]) } else { detail };
+                (note, detail, tint)
+            }),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = ctx;
+        disk_note(app, Some(l), None)
+    }
+}
+
 /// A layer's row and, expanded, its legend; returns the rectangle of both. With `reorder` off
 /// (the list is filtered or children are sorted by name) the row can't be dragged.
 fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: bool, t: &Tokens) -> Rect {
@@ -1919,7 +1936,7 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
         (text, w)
     });
     let mut shown = if l.definition_query.is_some() { format!("{}  {}", l.name, tl!("(filtered)")) } else { l.name.clone() };
-    let disk = disk_note(app, Some(l), None);
+    let disk = layer_note(app, l, ui.ctx());
     if let Some((note, _, _)) = disk.as_ref().filter(|(note, _, _)| !note.is_empty()) {
         shown = format!("{shown}  {note}");
     }
@@ -2129,6 +2146,83 @@ fn new_group(app: &mut RustGisApp, params: Value) {
     app.dialogs.text = name;
 }
 
+/// The several layers' Extrusion and Extrusion Base menus (#2160): the picked polygon layers
+/// raised alike by a numeric field every one has, or flattened, and, once all are raised, what
+/// they stand on. Two entries one level deep, as the ribbon's Type and Base menus, rather than
+/// nested menus three deep. One command for them all, so one undo step. Buttons, not radios: their
+/// settings may differ, and the ribbon shows one layer's.
+fn extrusion_menu(app: &mut RustGisApp, ui: &mut Ui, picked: &[u32]) {
+    let m = app.session.map();
+    let polygons: Vec<&Layer> =
+        picked.iter().filter_map(|id| m.layer(*id)).filter(|l| l.geometry_type() == GeometryType::Polygon).collect();
+    let Some((first, rest)) = polygons.split_first() else {
+        for label in ["Extrusion", "Extrusion Base"] {
+            ui.add_enabled(false, egui::Button::new(tl!(label))).on_disabled_hover_text(tl!("None of these layers are polygon layers."));
+        }
+        return;
+    };
+    // The numeric fields every one has, as the first spells them (the command matches each
+    // layer's own spelling).
+    let numeric = |l: &Layer, n: &str| l.dataset.field_index(n).and_then(|i| l.dataset.fields.get(i)).is_some_and(|f| f.ty.is_numeric());
+    let fields: Vec<String> = first
+        .dataset
+        .fields
+        .iter()
+        .filter(|f| f.ty.is_numeric() && rest.iter().all(|l| numeric(l, &f.name)))
+        .map(|f| f.name.clone())
+        .collect();
+    let raised = polygons.iter().all(|l| l.extrusion.is_some());
+    let ids: Vec<u32> = polygons.iter().map(|l| l.id).collect();
+    let run = |app: &mut RustGisApp, ui: &mut Ui, id: &str, mut p: Value| {
+        p["layer"] = json!(ids);
+        let _ = app.run(id, p);
+        ui.close();
+    };
+    // What both menus say first: that the others picked are left out, or that no field is shared.
+    let only = (ids.len() < picked.len()).then(|| {
+        let (n, all) = (ids.len().to_string(), picked.len().to_string());
+        crate::i18n::fmt("Polygon layers only: {n} of the {all} selected", &[("n", &n), ("all", &all)])
+    });
+    let head = |ui: &mut Ui| {
+        if let Some(text) = &only {
+            ui.weak(text.as_str());
+            ui.separator();
+        }
+    };
+    let by = |f: &str| crate::i18n::fmt("By {field}", &[("field", f)]);
+    let no_field = tl!("These layers share no numeric field.");
+    ui.menu_button(tl!("Extrusion"), |ui| {
+        head(ui);
+        if ui.button(tl!("None")).clicked() {
+            run(app, ui, "layer.extrusion", json!({"type": "none"}));
+        }
+        for f in &fields {
+            if ui.button(by(f)).clicked() {
+                run(app, ui, "layer.extrusion", json!({"type": "field", "field": f}));
+            }
+        }
+        if fields.is_empty() {
+            ui.weak(no_field);
+        }
+    });
+    if !raised {
+        ui.add_enabled(false, egui::Button::new(tl!("Extrusion Base")))
+            .on_disabled_hover_text(tl!("Extrude them all first: the base is what their walls stand on."));
+        return;
+    }
+    ui.menu_button(tl!("Extrusion Base"), |ui| {
+        head(ui);
+        if ui.button(tl!("Ground")).clicked() {
+            run(app, ui, "layer.extrusionBase", json!({"field": null, "base": 0}));
+        }
+        for f in &fields {
+            if ui.button(by(f)).clicked() {
+                run(app, ui, "layer.extrusionBase", json!({"field": f}));
+            }
+        }
+    });
+}
+
 /// The menu of several layers picked together: what acts on all of them; what needs one layer is
 /// there, dimmed, so it is known why it can't be used.
 fn layers_menu(app: &mut RustGisApp, ui: &mut Ui, picked: &[u32], reorder: bool) {
@@ -2201,6 +2295,7 @@ fn layers_menu(app: &mut RustGisApp, ui: &mut Ui, picked: &[u32], reorder: bool)
             }
         });
     }
+    extrusion_menu(app, ui, picked);
     ui.separator();
     for label in ["Attribute Table", "Symbology"] {
         ui.add_enabled(false, egui::Button::new(tl!(label))).on_disabled_hover_text(tl!("Pick a single layer."));
@@ -2663,6 +2758,12 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         "json",
                         "csv",
                         "tsv",
+                        "txt",
+                        "dat",
+                        "csv.gz",
+                        "tsv.gz",
+                        "txt.gz",
+                        "dat.gz",
                         "shp",
                         "tif",
                         "tiff",
@@ -2676,6 +2777,7 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         "rgis",
                         "rgisx",
                         "rgispkg",
+                        "rgisfield",
                         "rgismap",
                         "rgismpk",
                         "rgislyr",
@@ -2781,6 +2883,13 @@ pub struct GpForm {
     pub confirm_uninstall: bool,
     /// Why the last uninstall failed (apart from `last`, which a tool run sets too).
     pub uninstall_error: Option<String>,
+    /// GeoLibre tool translations downloading (#2224): the language, and the tools they name
+    /// (or why they couldn't be had) once the download is done.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub language_download: Option<(&'static str, crate::Slot<Result<usize, String>>)>,
+    /// Why the last download or removal of tool translations failed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub language_error: Option<String>,
 }
 
 /// A plugin tool running on a thread of its own.
@@ -3155,12 +3264,36 @@ impl GpForm {
     }
 }
 
+/// The card that stands for the GeoLibre tools on a phone, which can't run their program.
+fn no_geolibre_here(ui: &mut Ui, t: &Tokens) {
+    ui.add_space(6.0);
+    egui::Frame::NONE.stroke(Stroke::new(1.0, t.border)).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(10)).show(
+        ui,
+        |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(tl!("Whitebox and GeoLibre tools")).font(semibold(13.0)));
+            ui.label(
+                egui::RichText::new(tl!(
+                    "Not on a phone: these tools run as a program of their own, which a phone can't run. Use them in RustGIS on a computer."
+                ))
+                .size(11.5)
+                .color(t.text_dim),
+            );
+        },
+    );
+}
+
 /// Where to get the GeoLibre tools when the runner isn't installed (desktop and CLI builds only).
 fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // Read directly, not through Session::run: a command each frame would bump the session's
     // revision and make the views redraw. The status itself is cached in the runner module.
     let status = rustgis_engine::cmd::gp::geolibre_status();
     if status["supported"] != true {
+        // A phone's build leaves the suite out (its runner is a program, which a phone's apps
+        // can't start): said where the card would be, so the tools aren't simply missing (#1902).
+        if !rustgis_engine::data::RUNS_PROGRAMS && !cfg!(target_arch = "wasm32") {
+            no_geolibre_here(ui, t);
+        }
         return;
     }
     // An install that just finished: use the runner, and remember it.
@@ -3207,6 +3340,7 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 .size(11.5)
                 .color(t.text_dim),
             );
+            geolibre_passed_over(app, ui, t, true);
             ui.add_space(6.0);
             let progress = app.gp.install.as_ref().and_then(|st| st.lock().ok().map(|s| (s.done, s.total)));
             match progress {
@@ -3225,7 +3359,7 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         app.gp.install = Some(st.clone());
                         app.gp.last = None;
                         let ctx = ui.ctx().clone();
-                        std::thread::spawn(move || {
+                        let spawned = std::thread::Builder::new().name("geolibre-install".into()).spawn(move || {
                             let result = rustgis_engine::cmd::gp::install_geolibre(&|done, total| {
                                 if let Ok(mut s) = st.lock() {
                                     s.done = done;
@@ -3237,6 +3371,10 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                             }
                             ctx.request_repaint();
                         });
+                        if let Err(e) = spawned {
+                            app.gp.install = None;
+                            app.gp.last = Some((false, vec![e.to_string()]));
+                        }
                     }
                     ui.add_space(2.0);
                     ui.horizontal_wrapped(|ui| {
@@ -3268,6 +3406,19 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             }
         },
     );
+}
+
+/// Why a GeoLibre runner that was found (or remembered from Locate…) isn't used, its version
+/// being outside the range this RustGIS works with: which one and how to fix it, shown on the card
+/// and, while another runner is in use, under the tools' heading. Once: on the card
+/// (`shown_below`), not when the Locate… error drawn below it already says it.
+fn geolibre_passed_over(app: &RustGisApp, ui: &mut Ui, t: &Tokens, shown_below: bool) {
+    let Some(note) = rustgis_engine::cmd::gp::geolibre_passed_over() else { return };
+    if shown_below && matches!(&app.gp.last, Some((false, msgs)) if msgs.contains(&note)) {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(note).size(11.0).color(t.red));
 }
 
 /// Uninstalls the GeoLibre tools (a second press confirms): natively the runner that Install
@@ -3316,6 +3467,74 @@ fn geolibre_uninstall(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             app.gp.uninstall_error = None;
         }
         Err(e) => app.gp.uninstall_error = Some(e),
+    }
+}
+
+/// The GeoLibre tools in the interface's language (#2224): **Translate tools** downloads
+/// GeoLibre's pack for it, on a thread (one request of about 2 MB); **Remove translations**
+/// deletes the kept one. Nothing for English, or a language GeoLibre has no pack for.
+#[cfg(not(target_arch = "wasm32"))]
+fn geolibre_language(app: &mut RustGisApp, ui: &mut Ui) {
+    let lang = crate::i18n::current().code();
+    // One download at a time, whatever the language now: a second one would take the first's
+    // place, and the first's result (or failure) would never be shown.
+    if let Some((_, slot)) = &app.gp.language_download {
+        let done = slot.lock().ok().and_then(|mut r| r.take());
+        match done {
+            // A pack that names none of these tools (made for another runner version) would leave
+            // them in English under Remove translations, without a word.
+            Some(Ok(0)) => {
+                app.gp.language_download = None;
+                app.gp.language_error = Some(
+                    tl!("The downloaded translations name none of these tools: they may be for another GeoLibre version.").to_string(),
+                );
+            }
+            Some(Ok(_)) => {
+                app.gp.language_download = None;
+                app.gp.language_error = None;
+            }
+            Some(Err(e)) => {
+                app.gp.language_download = None;
+                app.gp.language_error = Some(e);
+            }
+            None => {
+                ui.spinner().on_hover_text(tl!("Downloading the tool translations…"));
+                return;
+            }
+        }
+    }
+    if !rustgis_engine::cmd::gp::geolibre_language_available(lang) {
+        return;
+    }
+    if rustgis_engine::cmd::gp::geolibre_language_in_use(lang) {
+        let resp = ui
+            .small_button(egui::RichText::new(tl!("Remove translations")).size(11.0))
+            .on_hover_text(tl!("Show these tools in English again"));
+        if resp.clicked() {
+            app.gp.language_error = app.run("gp.uninstallGeolibreLanguage", json!({"locale": lang})).err();
+        }
+        return;
+    }
+    let tip = crate::i18n::fmt(
+        "Download GeoLibre's translations of these tools into {language} (about 2 MB, from languages.geolibre.app)",
+        &[("language", crate::i18n::current().name())],
+    );
+    if ui.small_button(egui::RichText::new(tl!("Translate tools")).size(11.0)).on_hover_text(tip).clicked() {
+        let slot: crate::Slot<Result<usize, String>> = Default::default();
+        app.gp.language_download = Some((lang, slot.clone()));
+        app.gp.language_error = None;
+        let ctx = ui.ctx().clone();
+        let spawned = std::thread::Builder::new().name("geolibre-language".into()).spawn(move || {
+            let result = rustgis_engine::cmd::gp::install_geolibre_language(lang);
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(result);
+            }
+            ctx.request_repaint();
+        });
+        if let Err(e) = spawned {
+            app.gp.language_download = None;
+            app.gp.language_error = Some(e.to_string());
+        }
     }
 }
 
@@ -3486,6 +3705,22 @@ pub(crate) fn input_table<'a>(session: &'a Session, name: &str) -> Option<&'a ru
     rustgis_engine::project::find_table(tables, name).and_then(|i| tables.get(i))
 }
 
+/// Whether Find Tools shows `tool` for `q`, the search as [`TreeNode::fold`] folds it (lower case,
+/// no accents): its name or summary as shown (translated) or in English, or its id, holds it.
+/// `curvas de nivel` finds `Curvas de nível a partir de raster`, `dissolver` the built-in
+/// Dissolve shown as `Dissolver` (#2224).
+///
+/// [`TreeNode::fold`]: rustgis_engine::plugins::TreeNode::fold
+fn tool_matches(q: &str, tool: &rustgis_engine::analysis::ToolSpec) -> bool {
+    let fold = rustgis_engine::plugins::TreeNode::fold;
+    q.is_empty()
+        || tool.id.to_lowercase().contains(q)
+        || [tool.name, tool.summary].into_iter().any(|en| {
+            let shown = crate::i18n::t_raw(en);
+            fold(en).contains(q) || (shown != en && fold(shown).contains(q))
+        })
+}
+
 fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let Some(spec) = app.gp.tool.and_then(rustgis_engine::analysis::tool) else {
         // Tool finder, under the tool running, if one is.
@@ -3499,10 +3734,8 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         crate::widgets::search_field(ui, &mut app.gp.search, tl!("Find Tools"));
         ui.separator();
         ui.add_space(4.0);
-        let q = app.gp.search.to_lowercase();
-        let matches = |x: &rustgis_engine::analysis::ToolSpec| {
-            q.is_empty() || x.name.to_lowercase().contains(&q) || x.summary.to_lowercase().contains(&q) || x.id.to_lowercase().contains(&q)
-        };
+        let q = rustgis_engine::plugins::TreeNode::fold(&app.gp.search);
+        let matches = |x: &rustgis_engine::analysis::ToolSpec| tool_matches(&q, x);
         let row = |app: &mut RustGisApp, ui: &mut Ui, tool: &'static rustgis_engine::analysis::ToolSpec| {
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 42.0), Sense::click());
             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tl!(tool.name)));
@@ -3538,11 +3771,23 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             if q.is_empty() {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(tl!("GeoLibre")).size(11.0).color(t.text_dim));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| geolibre_uninstall(app, ui, t));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        geolibre_uninstall(app, ui, t);
+                        #[cfg(not(target_arch = "wasm32"))]
+                        geolibre_language(app, ui);
+                    });
                 });
                 if let Some(e) = &app.gp.uninstall_error {
                     ui.label(egui::RichText::new(e).size(11.0).color(t.red));
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(e) = &app.gp.language_error {
+                    ui.label(egui::RichText::new(e).size(11.0).color(t.red));
+                } else if let Some(e) = rustgis_engine::cmd::gp::geolibre_language_error(crate::i18n::current().code()) {
+                    let e = crate::i18n::fmt("The kept tool translations can't be read: {error}", &[("error", &e)]);
+                    ui.label(egui::RichText::new(e).size(11.0).color(t.red));
+                }
+                geolibre_passed_over(app, ui, t, false);
                 // As in GeoLibre's Processing menu: category › subcategory › tools
                 // (`GeoLibre › Terrain › Derivatives`; a tool without a subcategory sits
                 // directly in its category).
@@ -3700,7 +3945,7 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
         let label = ui.label(egui::RichText::new(format!("{}{}", tl!(p.label), if p.required { " *" } else { "" })).size(12.0));
         if !p.help.is_empty() {
-            label.on_hover_text(p.help);
+            label.on_hover_text(tl!(p.help));
         }
         let mut cur = app.gp.values.get(p.name).cloned().unwrap_or_default();
         if let Some(input) = crate::fieldlists::input(p.kind) {
@@ -5524,7 +5769,6 @@ fn marker_preview(ui: &Ui, m: &LineMarkers, x: (f32, f32), y: f32, k: f32, c: eg
 
 /// The stroke editor's rows for a stroke of markers or hash marks (`st`, its markers `m`): the
 /// shape, its size, where it goes and how far apart, and whether it turns with the line.
-#[allow(clippy::too_many_arguments)]
 fn marker_rows(
     app: &mut RustGisApp,
     ui: &mut Ui,
@@ -6717,10 +6961,14 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
         RasterRenderer::Colormap => {
             ui.label(egui::RichText::new(tl!("Colors from the raster's own color table.")).size(11.5).color(t.text_dim));
         }
-        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow, sky } => {
-            let (az, alt, zf, sh, sk, rp) = (*azimuth, *altitude, *z_factor, *shadow, *sky, ramp.as_ref().map(|r| r.name().to_string()));
+        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow, sky, fill, rock, ambient, balanced } => {
+            let (az, alt, zf, sh, sk, fl) = (*azimuth, *altitude, *z_factor, *shadow, *sky, *fill);
+            let am = relief_ambient(*ambient, *balanced);
+            let rp = ramp.as_ref().map(|r| r.name().to_string());
             let relief = move |band: usize, az: f64, alt: f64, zf: f64, sh: f64| {
-                let mut p = json!({"type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf, "shadow": sh, "sky": sk});
+                let mut p = json!({
+                    "type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf, "shadow": sh, "sky": sk, "fill": fl
+                });
                 match &rp {
                     Some(r) => p["ramp"] = json!(r),
                     None => p["grey"] = json!(true),
@@ -6735,6 +6983,8 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     ("Z factor", zf, 0.001..=1000.0, 0.01, 2),
                     ("Cast shadows", sh, 0.0..=1.0, 0.01, 3),
                     ("Sky visibility", sk, 0.0..=1.0, 0.01, 4),
+                    ("Fill light", fl, 0.0..=1.0, 0.01, 5),
+                    ("Ambient", am, 0.0..=1.0, 0.01, 6),
                 ] {
                     let input_label = ui.label(tl!(label));
                     let mut x = v;
@@ -6748,6 +6998,10 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                         4 => r.on_hover_text(tl!(
                             "How much the sky each cell sees, over the terrain around it, scales its ambient light, from 0 (not at all) to 1"
                         )),
+                        5 => r.on_hover_text(tl!(
+                            "A light from the side opposite the sun that lightens the slopes turned toward it, from 0 (none) to 1"
+                        )),
+                        6 => r.on_hover_text(tl!("The share of the colour a slope turned fully from the sun keeps, from 0 to 1")),
                         _ => r,
                     };
                     if drag.settled(ui, &r, &mut x) && x != v {
@@ -6759,14 +7013,28 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                             _ => (az, alt, zf, sh),
                         };
                         let mut p = relief(*band, a, b, c, d);
-                        if which == 4 {
-                            p["sky"] = json!(x);
+                        match which {
+                            4 => p["sky"] = json!(x),
+                            5 => p["fill"] = json!(x),
+                            6 => p["ambient"] = json!(x),
+                            _ => {}
                         }
                         let _ = app.run("raster.symbology", p);
                     }
                     ui.end_row();
                 }
             });
+            let mut on = *balanced;
+            if ui
+                .checkbox(&mut on, tl!("Balanced light"))
+                .on_hover_text(tl!("Flat ground keeps the ramp's colour and slopes facing the sun brighten"))
+                .changed()
+            {
+                let mut p = relief(*band, az, alt, zf, sh);
+                p["balanced"] = json!(on);
+                let _ = app.run("raster.symbology", p);
+            }
+            rock_on_slopes(app, ui, l.id, *rock, relief(*band, az, alt, zf, sh));
             let mut tint = ramp.is_some();
             if ui.checkbox(&mut tint, tl!("Tint by elevation")).changed() {
                 let mut p = relief(*band, az, alt, zf, sh);
@@ -6920,6 +7188,50 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
     ui.separator();
     ui.label(egui::RichText::new(tl!("Layer")).size(11.5).color(t.text_dim));
     transparency_row(app, ui, l);
+}
+
+/// Shaded Relief's Rock on steep slopes (#1913): a check box and, when it is on, the slopes in
+/// degrees the rock colour starts and ends at and the colour. `relief` is the layer's Shaded
+/// Relief as `raster.symbology` takes it, to which the rock is added.
+fn rock_on_slopes(app: &mut RustGisApp, ui: &mut Ui, layer: u32, rock: Option<Rock>, relief: Value) {
+    let send = |app: &mut RustGisApp, rock: Value| {
+        let mut p = relief.clone();
+        p["rock"] = rock;
+        let _ = app.run("raster.symbology", p);
+    };
+    let mut on = rock.is_some();
+    if ui
+        .checkbox(&mut on, tl!("Rock on steep slopes"))
+        .on_hover_text(tl!("Tints steep ground toward a rock colour before the light shades it, by the ground's own slope"))
+        .changed()
+    {
+        send(app, if on { json!({}) } else { json!(false) });
+    }
+    let Some(rock) = rock else { return };
+    egui::Grid::new(("relief_rock", layer)).num_columns(2).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
+        for (label, v, which) in [("From", rock.from, 0), ("To", rock.to, 1)] {
+            let input_label = ui.label(tl!(label));
+            let mut x = v;
+            // Kept across a drag until it is let go (#607).
+            let drag = Dragged::lend(ui, egui::Id::unique(("relief_rock_drag", layer, which)), &mut x);
+            let r = ui
+                .add(egui::DragValue::new(&mut x).update_while_editing(false).range(0.0..=90.0).speed(0.5).max_decimals(1).suffix("°"))
+                .labelled_by(input_label.id);
+            if drag.settled(ui, &r, &mut x) && x != v {
+                // The other end moves along rather than cross it.
+                let (from, to) =
+                    if which == 0 { (x.min(89.0), rock.to.max(x.min(89.0) + 1.0)) } else { (rock.from.min(x.max(1.0) - 1.0), x.max(1.0)) };
+                send(app, json!({"from": from, "to": to}));
+            }
+            ui.end_row();
+        }
+        let input_label = ui.label(tl!("Color"));
+        let mut c = egui::Color32::from_rgb(rock.color.r(), rock.color.g(), rock.color.b());
+        if crate::widgets::color_button(ui, &mut c).labelled_by(input_label.id).changed() {
+            send(app, json!({"color": rustgis_engine::map::Rgba::rgb(c.r(), c.g(), c.b()).hex()}));
+        }
+        ui.end_row();
+    });
 }
 
 /// The Masking section of a raster's symbology (#348): values drawn as no data, and a range of
@@ -7083,6 +7395,30 @@ pub(crate) fn layout_menu(app: &mut RustGisApp, ui: &mut Ui, n: &str) {
 mod tests {
     use super::*;
 
+    /// Find Tools finds a tool by what it shows in the interface's language as well as by its
+    /// English name and id, without minding case or accents (#2224).
+    #[test]
+    fn find_tools_matches_the_shown_name_without_accents() {
+        let dissolve = rustgis_engine::analysis::tool("dissolve").expect("the built-in Dissolve");
+        let kernel = rustgis_engine::analysis::tool("kernelDensity").expect("the built-in Kernel Density");
+        let fold = rustgis_engine::plugins::TreeNode::fold;
+        crate::i18n::set_current(crate::i18n::Lang::from_code("pt").expect("Portuguese"));
+        let shown = crate::i18n::t_raw(dissolve.name);
+        assert_ne!(shown, dissolve.name, "the test needs Dissolve translated into Portuguese");
+        assert!(tool_matches(&fold(shown), dissolve), "{shown}");
+        assert!(tool_matches(&fold("DISSOLVE"), dissolve), "the English name still finds it");
+        assert!(tool_matches(&fold("dissolve"), dissolve) && tool_matches("", dissolve));
+        let shown = crate::i18n::t_raw(kernel.name);
+        let plain: String = fold(shown);
+        assert!(tool_matches(&plain, kernel), "{shown} without its accents or case");
+        assert!(!tool_matches(&fold("curvas de nivel"), dissolve));
+        crate::i18n::set_current(crate::i18n::Lang::EN);
+        assert!(!tool_matches(
+            &fold(crate::i18n::Lang::from_code("pt").map(|pt| crate::i18n::tr_raw(pt, dissolve.name)).unwrap_or("")),
+            dissolve
+        ));
+    }
+
     /// An external tool's optional layer inputs stay empty until they're picked, and its required
     /// ones start at the active layer; a built-in tool's optional one still follows it (#1517).
     #[cfg(not(target_arch = "wasm32"))]
@@ -7211,7 +7547,7 @@ mod tests {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while h.state().gp.tool_run.is_some() {
             assert!(std::time::Instant::now() < end, "the run never landed");
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10)); // test-wait: legacy polling for the background tool
             h.step();
         }
         let app = h.state();
@@ -7448,7 +7784,7 @@ mod tests {
                 let ctx = ui.ctx().clone();
                 app.logic(&ctx);
                 if frame.get() {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    std::thread::sleep(std::time::Duration::from_millis(300)); // test-wait: simulate a slow frame between double-clicks
                 }
                 app.ui(ui);
             },
@@ -7540,7 +7876,7 @@ mod tests {
             if rustgis_engine::render::tile_source_layers(&app.session.map().tiles[0]).is_some() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10)); // test-wait: legacy polling for archive source layers
         }
         let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
             |ui, app: &mut RustGisApp| {

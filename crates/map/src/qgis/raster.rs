@@ -96,6 +96,10 @@ fn renderer_style(node: Node, pipe: Node, r: Node, kind: &str, layer: &str, repo
                 z_factor: num("zfactor", 1.0).clamp(0.0001, 10_000.0),
                 shadow: 0.0,
                 sky: 0.0,
+                fill: 0.0,
+                rock: None,
+                ambient: None,
+                balanced: false,
             };
             (renderer, Stretch::None)
         }

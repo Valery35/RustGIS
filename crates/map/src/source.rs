@@ -34,6 +34,9 @@ pub const VIEW_LIMIT: usize = if cfg!(target_arch = "wasm32") { 100_000 } else {
 /// The most features a view reads from a file by its web address (each one is fetched).
 pub const REMOTE_VIEW_LIMIT: usize = if cfg!(target_arch = "wasm32") { 30_000 } else { 60_000 };
 
+/// Repair advice shared by render errors and the session's translated read-failure notice.
+pub const REPAIR_SOURCE: &str = "if the file was moved or deleted, restore it or use Repair Data Source to point to its new location";
+
 const RECONNECT_REQUIRED: &str = "this database source came from a peer; reconnect explicitly before reading it";
 
 /// Ambiguous polygon areas among decoded features, including rows an area query could not keep.
@@ -96,8 +99,13 @@ pub struct SourceLayer {
     /// said by [`SourceLayer::take_unread_dates`]; once said, later reads aren't counted again.
     #[serde(skip)]
     unread_dates: Option<Vec<usize>>,
+    /// Date-times a view read rounded to the microsecond ([`Batch::rounded_dates`]), likewise.
+    #[serde(skip)]
+    rounded_dates: Option<Vec<usize>>,
     #[serde(skip)]
     unread_dates_said: bool,
+    #[serde(skip)]
+    rounded_dates_said: bool,
     #[serde(skip)]
     window: Option<Window>,
     /// Whole-source thinning decisions shared by render snapshots, independent of view rows.
@@ -134,6 +142,9 @@ pub struct SourceLayer {
     /// Why the source couldn't be opened or read.
     #[serde(skip)]
     pub error: Option<String>,
+    /// Last read failure reported by the session, independent of disposable render copies.
+    #[serde(skip)]
+    error_said: Option<String>,
     /// The last open failed because the server refused the login (no password given this session, or a wrong one).
     #[serde(skip)]
     pub login: bool,
@@ -708,20 +719,31 @@ impl SourceLayer {
     /// Keeps what view reads found of values in date fields that weren't dates, until
     /// [`SourceLayer::take_unread_dates`] says it. Once said, later reads aren't counted: they
     /// read the same features again, and the notice says Load All Features counts them all.
-    pub fn saw_unread_dates(&mut self, counts: &[usize]) {
-        if self.unread_dates_said || !counts.iter().any(|n| *n > 0) {
-            return;
+    /// Each kind is counted until its own notice is said, so saying one doesn't silence the other.
+    pub fn saw_unread_dates(&mut self, unread: &[usize], rounded: &[usize]) {
+        if !self.unread_dates_said && unread.iter().any(|n| *n > 0) {
+            rustgis_data::source::add_unread_dates(self.unread_dates.get_or_insert_with(Vec::new), unread);
         }
-        rustgis_data::source::add_unread_dates(self.unread_dates.get_or_insert_with(Vec::new), counts);
+        if !self.rounded_dates_said && rounded.iter().any(|n| *n > 0) {
+            rustgis_data::source::add_unread_dates(self.rounded_dates.get_or_insert_with(Vec::new), rounded);
+        }
     }
 
     /// What view reads found of values in date fields that weren't dates
-    /// ([`rustgis_data::source::unread_dates_note`]), once for the source.
-    pub fn take_unread_dates(&mut self) -> Option<String> {
-        let fields = self.info()?.fields.clone();
-        let counts = self.unread_dates.take()?;
-        self.unread_dates_said = true;
-        rustgis_data::source::unread_dates_note(&fields, &counts)
+    /// ([`rustgis_data::source::unread_dates_note`]) and of date-times rounded to the microsecond
+    /// ([`rustgis_data::source::rounded_dates_note`]), once for the source.
+    pub fn take_unread_dates(&mut self) -> (Option<String>, Option<String>) {
+        let Some(fields) = self.info().map(|i| i.fields.clone()) else { return (None, None) };
+        let (unread, rounded) = (self.unread_dates.take(), self.rounded_dates.take());
+        if unread.is_none() && rounded.is_none() {
+            return (None, None);
+        }
+        self.unread_dates_said |= unread.is_some();
+        self.rounded_dates_said |= rounded.is_some();
+        (
+            unread.and_then(|c| rustgis_data::source::unread_dates_note(&fields, &c)),
+            rounded.and_then(|c| rustgis_data::source::rounded_dates_note(&fields, &c)),
+        )
     }
 
     /// Whether another installed window needs its retained display expressions checked.
@@ -745,6 +767,33 @@ impl SourceLayer {
             self.path.as_deref()
         };
         p.filter(|p| crate::paths::is_local(p))
+    }
+
+    /// A read failure with the linked file and the repair action, when it has a local source.
+    /// The caller supplies the layer's current name, which can differ from the file's name.
+    pub fn read_error(&self) -> Option<String> {
+        let error = self.error.as_ref()?;
+        Some(match self.linked_file() {
+            Some(path) => format!("could not read {path}: {error}; {REPAIR_SOURCE}"),
+            None => error.clone(),
+        })
+    }
+
+    /// Clears a recovered failure and its notice marker, even between notice passes.
+    pub fn clear_error(&mut self) {
+        self.error = None;
+        self.error_said = None;
+    }
+
+    /// Takes each persistent read failure once, so redraws do not repeat its notice. A successful
+    /// read, or an explicit reopen/repair, allows a later failure to be reported.
+    pub fn error_unsaid(&mut self) -> Option<String> {
+        if self.error == self.error_said {
+            return None;
+        }
+        let error = self.error.clone();
+        self.error_said.clone_from(&error);
+        error
     }
 
     /// Opens a replacement with fresh handles, windows, caches and selection.
@@ -772,8 +821,13 @@ impl SourceLayer {
                 declared_empty = fresh.empty;
                 conversion_zm_dropped = fresh.zm_dropped;
                 new.path = Some(fresh.path.display().to_string());
-                let handle = rustgis_data::source::fgb::FgbSource::open_owned_path(&fresh.path, layer, fresh.workspace)
-                    .map_err(|e| format!("{path}: {e}"))?;
+                let handle = rustgis_data::source::fgb::FgbSource::open_converted_path(
+                    &fresh.path,
+                    layer,
+                    std::path::Path::new(path),
+                    Some(fresh.workspace),
+                )
+                .map_err(|e| format!("{path}: {e}"))?;
                 new.handle = Some(Arc::new(handle));
                 new.gdal = Some(GdalOrigin { path: path.into(), layer: layer.into(), ..g.clone() });
             }
@@ -803,8 +857,13 @@ impl SourceLayer {
                 let part = out.parts.first().ok_or_else(|| format!("{path}: the table returns no {}", d.family.label()))?;
                 declared_empty = part.count == 0;
                 new.path = Some(part.path.display().to_string());
-                let handle = rustgis_data::source::parquet::ParquetSource::open_owned_path(&part.path, name, fresh.workspace)
-                    .map_err(|e| format!("{path}: {e}"))?;
+                let handle = rustgis_data::source::parquet::ParquetSource::open_converted_path(
+                    &part.path,
+                    name,
+                    Some(std::path::Path::new(path)),
+                    Some(fresh.workspace),
+                )
+                .map_err(|e| format!("{path}: {e}"))?;
                 new.handle = Some(Arc::new(handle));
                 conversion_zm_dropped = false;
                 new.duckdb = Some(d);
@@ -951,7 +1010,7 @@ impl SourceLayer {
                 self.conversion_notes_unsaid = self.conversion_info.as_ref().map(|info| info.notes.clone()).unwrap_or_default();
                 self.opening = None;
                 self.reset();
-                self.error = None;
+                self.clear_error();
                 self.login = false;
                 Ok(())
             }
@@ -1043,13 +1102,26 @@ impl SourceLayer {
             if p.to_ascii_lowercase().ends_with(".fgb") {
                 let path = std::path::Path::new(p);
                 let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
-                let prepared = rustgis_data::source::fgb::FgbSource::prepare_path(path, name);
+                let prepared = match &self.gdal {
+                    Some(g) => rustgis_data::source::fgb::FgbSource::prepare_converted_path(path, name, std::path::Path::new(&g.path)),
+                    None => rustgis_data::source::fgb::FgbSource::prepare_path(path, name),
+                };
                 self.conversion_fallback = saved_conversion_note;
                 return self.open_fgb(prepared);
             }
             let opened = {
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(crs) = overridden {
+                if let Some(d) = &self.duckdb {
+                    use rustgis_data::source::{duckdb::Database, parquet::ParquetSource};
+                    let database = d.database.as_deref().map(Database::parse);
+                    let original = match &database {
+                        Some(Database::File(path)) => Some(path.as_path()),
+                        _ => None,
+                    };
+                    let path = std::path::Path::new(p);
+                    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
+                    ParquetSource::open_converted_path(path, name, original, None).map(|src| Box::new(src) as Box<dyn FeatureSource>)
+                } else if let Some(crs) = overridden {
                     let name = std::path::Path::new(p).file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
                     rustgis_data::source::shp::ShpSource::open_path_in(std::path::Path::new(p), name, Some(crs))
                         .map(|src| Box::new(src) as Box<dyn FeatureSource>)
@@ -1064,7 +1136,15 @@ impl SourceLayer {
                 #[cfg(not(target_arch = "wasm32"))]
                 (Err(_), Some(d)) if !std::path::Path::new(p).exists() => match rerun(d) {
                     Ok(fresh) => {
-                        let r = rustgis_data::source::open_path(&fresh, None);
+                        use rustgis_data::source::{duckdb::Database, parquet::ParquetSource};
+                        let database = d.database.as_deref().map(Database::parse);
+                        let original = match &database {
+                            Some(Database::File(path)) => Some(path.as_path()),
+                            _ => None,
+                        };
+                        let name = fresh.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
+                        let r = ParquetSource::open_converted_path(&fresh, name, original, None)
+                            .map(|src| Box::new(src) as Box<dyn FeatureSource>);
                         if r.is_ok() {
                             self.path = Some(fresh.display().to_string());
                         }
@@ -1086,7 +1166,7 @@ impl SourceLayer {
                     self.conversion_fallback = saved_conversion_note;
                 }
                 self.window = None;
-                self.error = None;
+                self.clear_error();
                 self.login = false;
                 Ok(())
             }
@@ -1151,7 +1231,7 @@ impl SourceLayer {
             wake();
         };
         self.handle = None;
-        self.error = None;
+        self.clear_error();
         self.reset();
         if let Err(e) = std::thread::Builder::new().name("rustgis-source-open".into()).spawn(job) {
             return self.opened(Err(format!("couldn't start opening the layer: {e}")));
@@ -1275,7 +1355,7 @@ impl SourceLayer {
             Ok(s) => {
                 self.handle = Some(s);
                 self.window = None;
-                self.error = None;
+                self.clear_error();
                 Ok(())
             }
             Err(e) => {
@@ -1388,11 +1468,13 @@ impl SourceLayer {
         self.handle = None;
         self.opening = None;
         self.pending = None;
-        self.error = None;
+        self.clear_error();
         self.login = false;
         // A new opening may hold other values: what was said of the last one doesn't hold.
         self.unread_dates = None;
+        self.rounded_dates = None;
         self.unread_dates_said = false;
+        self.rounded_dates_said = false;
         self.reset();
         self.open()
     }
@@ -1585,7 +1667,7 @@ impl SourceLayer {
                     self.ready_cache = Some(cache);
                     let w = Window { extent: p.extent, complete: b.complete, matched: b.matched, kept: b.features.len(), filtered };
                     self.window = Some(w);
-                    self.error = None;
+                    self.clear_error();
                     return Polled::Done(w, b);
                 }
                 Some(Err(e)) => {
@@ -1698,6 +1780,7 @@ impl SourceLayer {
             query: _,
             opening: _,
             error: _,
+            error_said: _,
             login: _,
             reconnect_required: _,
             limit: _,
@@ -1709,7 +1792,9 @@ impl SourceLayer {
             conversion_fallback: _,
             conversion_notes_unsaid: _,
             unread_dates: _,
+            rounded_dates: _,
             unread_dates_said: _,
+            rounded_dates_said: _,
             gdal,
             duckdb,
             postgis,
@@ -1735,10 +1820,13 @@ impl SourceLayer {
         if let Some(g) = gdal {
             out.push((R::GdalPath, g.path.as_str(), false, paths::is_local(&g.path)));
         }
-        if let Some(d) = duckdb
-            && let Some(p) = &d.database
-        {
-            out.push((R::DuckDbDatabase, p.as_str(), true, paths::is_local(p)));
+        if let Some(d) = duckdb {
+            if let Some(p) = &d.database {
+                out.push((R::DuckDbDatabase, p.as_str(), true, paths::is_local(p)));
+            }
+            if let Some(sql) = &d.sql {
+                out.push((R::DuckDbSql, sql.as_str(), true, false));
+            }
         }
         if let Some(pg) = postgis {
             out.push((R::PostgisDatabase, pg.database.as_str(), true, false));
@@ -1758,6 +1846,7 @@ impl SourceLayer {
             crate::LayerRole::Streamed => self.path.as_mut(),
             crate::LayerRole::GdalPath => Some(&mut self.gdal.as_mut()?.path),
             crate::LayerRole::DuckDbDatabase => self.duckdb.as_mut()?.database.as_mut(),
+            crate::LayerRole::DuckDbSql => self.duckdb.as_mut()?.sql.as_mut(),
             crate::LayerRole::PostgisDatabase => Some(&mut self.postgis.as_mut()?.database),
             crate::LayerRole::MysqlDatabase => Some(&mut self.mysql.as_mut()?.database),
             crate::LayerRole::SqlServerDatabase => Some(&mut self.sqlserver.as_mut()?.database),
@@ -1768,6 +1857,29 @@ impl SourceLayer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn whole_layer_report_keeps_effective_conversion_notes_and_dimensions() {
+        use rustgis_data::{Dataset, GeometryType};
+        let mut original = Dataset::new("converted", GeometryType::Point, Vec::new());
+        original.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(1.0, 2.0))), Vec::new());
+        let bytes = std::sync::Arc::new(rustgis_data::source::fgb::write(&original).unwrap());
+        let handle = rustgis_data::source::open_shared("converted.fgb", bytes.clone(), None).unwrap();
+        let mut source = super::SourceLayer::from_bytes("converted.fgb", bytes, None, handle);
+        let mut info = source.info().unwrap().clone();
+        info.notes.push("conversion left out 2 source features".into());
+        info.zm_dropped = true;
+        source.conversion_info = Some(info);
+        let mut layer = crate::Layer::new(1, Dataset::new("layer", GeometryType::Point, Vec::new()));
+        layer.source = Some(source);
+        let (dataset, report) = layer.load_all_reported().unwrap();
+        assert!(dataset.zm_dropped);
+        assert_eq!(report.messages.iter().filter(|n| n.contains("conversion left out 2 source features")).count(), 1);
+        assert_eq!(dataset.features.len(), 1);
+        let (_, counted) = layer.load_all_counted().unwrap();
+        assert_eq!(counted.messages.iter().filter(|n| n.contains("conversion left out 2 source features")).count(), 1);
+        assert!(!counted.zm_noted, "a flag with no Z/M diagnostic cannot suppress the export warning");
+    }
+
     /// Project-restored disk and embedded date sources schedule their classification, share
     /// the pending open across copies, and expose typed dates only after it lands.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1804,6 +1916,33 @@ mod tests {
         assert!(repaired.is_open() && !repaired.is_pending());
         assert_eq!(repaired.info().unwrap().fields[0].ty, FieldType::Date);
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Unread dates and rounded date-times are each said once, and saying one doesn't silence the
+    /// other, whichever a view read finds first.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn unread_and_rounded_date_notices_are_said_independently() {
+        use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value};
+        let mut ds = Dataset::new("dates", GeometryType::Point, vec![Field::new("at", FieldType::DateTime)]);
+        ds.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))), vec![Value::Null]);
+        let bytes = std::sync::Arc::new(rustgis_data::source::fgb::write(&ds).unwrap());
+        for unread_first in [true, false] {
+            let mut source =
+                super::SourceLayer { file_name: Some("dates.fgb".into()), embedded: Some(bytes.clone()), ..Default::default() };
+            source.open().unwrap();
+            source.wait_open(std::time::Duration::from_secs(5));
+            assert!(source.is_open(), "{:?}", source.error);
+            let (first, second): (&[usize], &[usize]) = if unread_first { (&[1], &[]) } else { (&[], &[1]) };
+            source.saw_unread_dates(first, second);
+            let said = source.take_unread_dates();
+            assert_eq!((said.0.is_some(), said.1.is_some()), (unread_first, !unread_first));
+            // The other kind, found by a later read, is still said; the said kind isn't again.
+            source.saw_unread_dates(&[2], &[2]);
+            let said = source.take_unread_dates();
+            assert_eq!((said.0.is_some(), said.1.is_some()), (!unread_first, unread_first), "unread first: {unread_first}");
+            assert_eq!(source.take_unread_dates(), (None, None));
+        }
     }
 
     /// A paused schema worker reports real progress; Cancel wins for every source copy and

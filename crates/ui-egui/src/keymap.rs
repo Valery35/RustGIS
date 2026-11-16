@@ -64,6 +64,8 @@ pub const MAP_TOOLS: &[(&str, &str)] = &[
     ("createLine", "Create Line"),
     ("createPolygon", "Create Polygon"),
     ("editVertices", "Edit Vertices"),
+    ("rotatedBox", "Rotated Box"),
+    ("circle", "Circle"),
     ("cutPolygon", "Cut Polygon"),
     ("reshape", "Reshape"),
 ];
@@ -71,6 +73,7 @@ pub const MAP_TOOLS: &[(&str, &str)] = &[
 /// Labels of the `ui.*` commands that have a shortcut but no entry in Command Search.
 const UI_LABELS: &[(&str, &str)] = &[
     ("ui.commandSearch", "Command Search"),
+    ("ui.convertShape", "Convert Polygon to Shape…"),
     ("ui.open", "Open Project…"),
     ("ui.save", "Save Project"),
     ("ui.saveAs", "Save Project As…"),

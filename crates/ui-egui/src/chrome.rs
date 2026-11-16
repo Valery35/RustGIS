@@ -498,6 +498,40 @@ fn source_open_status(app: &RustGisApp, ui: &mut Ui, t: &Tokens) {
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
 }
 
+/// Whether work is running that the status bar shows with its progress and Cancel: an export, a
+/// file or a layer being read, a download.
+pub(crate) fn background_busy(app: &RustGisApp) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.export_job.is_some() || crate::readjob::showing(app) || sources_opening(app) {
+        return true;
+    }
+    !app.ui.downloads.is_empty() || window_reads_under_way(app)
+}
+
+/// That work's progress and Cancel, as the status bar draws them, for a shell without one.
+pub(crate) fn background_status(app: &mut RustGisApp, ui: &mut Ui) {
+    let t = Tokens::get(ui.ctx());
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.export_job.is_some() {
+        crate::exportjob::status(app, ui, &t);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::readjob::showing(app) {
+        crate::readjob::status(app, ui, &t);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    source_open_status(app, ui, &t);
+    if !app.ui.downloads.is_empty() || window_reads_under_way(app) {
+        downloads_status(app, ui, &t);
+    }
+}
+
+/// Whether a restored layer's dates are still being read ([`source_open_status`] shows them).
+#[cfg(not(target_arch = "wasm32"))]
+fn sources_opening(app: &RustGisApp) -> bool {
+    app.session.project.maps.iter().flat_map(|m| &m.layers).filter_map(|l| l.source.as_ref()).any(|s| s.opening_progress().is_some())
+}
+
 /// Whether windows are being read off the frame (none in the browser).
 fn window_reads_under_way(app: &RustGisApp) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
@@ -722,6 +756,23 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             }
             continue;
         }
+        // Esc cancels a held box gesture before leaving the drawing tool on another press.
+        if id == "tool.set"
+            && p.get("tool").and_then(serde_json::Value::as_str) == Some("explore")
+            && app.session.tool == rustgis_engine::Tool::RotatedBox
+            && crate::boxedit::drawing(app)
+        {
+            crate::boxedit::cancel(app);
+            continue;
+        }
+        if id == "tool.set"
+            && p.get("tool").and_then(serde_json::Value::as_str) == Some("explore")
+            && app.session.tool == rustgis_engine::Tool::Circle
+            && crate::circleedit::drawing(app)
+        {
+            crate::circleedit::cancel(app);
+            continue;
+        }
         // With Edit Vertices, Delete removes the chosen vertex rather than the feature.
         if id == "edit.delete"
             && app.session.active_layout.is_none()
@@ -810,6 +861,7 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.customizeShortcuts", "Keyboard Shortcuts", "Settings › Customize"),
     ("ui.addData", "Add Data…", "Home › Add"),
     ("ui.addDelimited", "Add Delimited Text…", "Home › Add › Add Data"),
+    ("ui.addDxf", "Import DXF…", "Home › Add › Add Data"),
     ("ui.addUrl", "Add Data From URL…", "Home › Add › Add Data"),
     ("ui.addZarr", "Add Zarr Variable…", "Home › Add › Add Data"),
     ("ui.addService", "Add From Service…", "Home › Add › Add Data"),
@@ -867,6 +919,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
     Some(match id {
         "project.open" => Command("ui.open"),
         "project.save" => Command("ui.save"),
+        "edit.previewShapeConversion" => Command("ui.convertShape"),
         "project.saveAs" => Command("ui.saveAs"),
         "project.addFolder" => Command("ui.addFolder"),
         "project.fromTemplate" => OpenItem("template"),
@@ -877,6 +930,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "map.package" => SaveItem("mapPackage"),
         "map.rename" => Dialog("renameMap"),
         "map.goToXY" => Dialog("goToXY"),
+        "map.exportOrbit" => Dialog("exportOrbit"),
         "map.findPlace" => Dialog("findPlace"),
         "map.camera" | "map.setScale" => Dialog("camera"),
         "map.basemap" => Dialog("basemap"),
@@ -1430,7 +1484,6 @@ pub fn notices(app: &mut RustGisApp, ctx: &egui::Context) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
