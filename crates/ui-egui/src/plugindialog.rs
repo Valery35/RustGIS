@@ -133,7 +133,7 @@ fn shown(mut text: String) -> String {
     let more = text[end..].chars().count();
     text.truncate(end);
     text.push('\n');
-    text.push_str(&crate::i18n::fmt("вЂ¦ {n} more characters not shown", &[("n", &more.to_string())]));
+    text.push_str(&crate::i18n::fmt("… {n} more characters not shown", &[("n", &more.to_string())]));
     text
 }
 
@@ -213,7 +213,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     let mut run = false;
 
     let mut open = true;
-    let title = format!("{} вЂє {}", m.translate(&lang, &m.name), m.translate(&lang, &c.label).replace('\n', " "));
+    let title = format!("{} › {}", m.translate(&lang, &m.name), m.translate(&lang, &c.label).replace('\n', " "));
     egui::Window::new(title)
         .id(egui::Id::unique(("plugin_form", &d.plugin, &d.command)))
         .open(&mut open)
@@ -232,7 +232,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             // frame (a row's worth before the first), and never takes the window's last rows.
             let row = ui.spacing().interact_size.y;
             let footer = if d.footer > 0.0 { d.footer } else { row + 2.0 * ui.spacing().item_spacing.y + 6.0 };
-            let room = (ui.available_height() - footer).clamp(row, 460.0);
+            let room = (ui.available_height() - footer).max(row).min(460.0);
             egui::ScrollArea::vertical().id_salt("plugin_form_fields").max_height(room).auto_shrink([false, true]).show(ui, |ui| {
                 egui::Grid::new(("plugin_form_grid", &d.plugin, &d.command)).num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                     // A field lists the fields of the layer chosen above it.
@@ -271,7 +271,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 }
                 if running {
                     ui.spinner();
-                    ui.label(tl!("RunningвЂ¦"));
+                    ui.label(tl!("Running…"));
                 }
             });
             if let Some(r) = &d.result {
@@ -321,7 +321,7 @@ fn layer_kind(kind: &str) -> Option<ParamKind> {
 }
 
 /// A drop-down of `(value, label)` options for `values[key]`. A required one never stays unset:
-/// an unset or vanished value becomes `start`, or the first option. An optional one offers `вЂ”`,
+/// an unset or vanished value becomes `start`, or the first option. An optional one offers `—`,
 /// which leaves it out, and starts there.
 fn combo(
     ui: &mut Ui,
@@ -346,12 +346,12 @@ fn combo(
         }
     }
     let cur = values.get(key).and_then(Value::as_str).map(str::to_string);
-    let shown = cur.as_ref().and_then(|c| options.iter().find(|o| o.0 == *c)).map_or("вЂ”", |o| o.1.as_str());
+    let shown = cur.as_ref().and_then(|c| options.iter().find(|o| o.0 == *c)).map_or("—", |o| o.1.as_str());
     egui::ComboBox::from_id_salt(id)
         .selected_text(shown)
         .width(280.0)
         .show_ui(ui, |ui| {
-            if !required && ui.selectable_label(cur.is_none(), "вЂ”").clicked() {
+            if !required && ui.selectable_label(cur.is_none(), "—").clicked() {
                 values.remove(key);
             }
             for (v, label) in options {
@@ -703,8 +703,8 @@ mod tests {
         assert_eq!(number("0e10"), Some(json!(0)));
         assert_eq!(number(""), None);
         // A long one is cut, and says how much was left out.
-        let long = shown("Г©".repeat(40_000));
+        let long = shown("é".repeat(40_000));
         assert!(long.len() < SHOWN + 100, "{}", long.len());
-        assert!(long.ends_with("вЂ¦ 7232 more characters not shown"), "{}", &long[long.len() - 60..]);
+        assert!(long.ends_with("… 7232 more characters not shown"), "{}", &long[long.len() - 60..]);
     }
 }
